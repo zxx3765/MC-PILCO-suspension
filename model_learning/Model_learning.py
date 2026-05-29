@@ -482,7 +482,7 @@ class Model_learning(torch.nn.Module):
         delta_var = torch.cat(gp_output_var_list, 1)
         if particle_pred == True:
             # sample delta from distribution
-            delta_distribution = Normal(delta_mean, torch.sqrt(delta_var))
+            delta_distribution = Normal(delta_mean, torch.sqrt(torch.clamp(delta_var, min=1e-8)))
             delta_sample = delta_distribution.rsample()
             # delta_sample = delta_mean + torch.sqrt(delta_var)*torch.randn(delta_mean.shape, dtype=self.dtype, device=self.device)
         else:
@@ -701,7 +701,7 @@ class Speed_Model_learning_RBF_angle_state(Model_learning):
 
         if particle_pred == True:
             # sample delta speed from distribution
-            delta_speed_distribution = Normal(delta_vel_mean, torch.sqrt(delta_vel_var))
+            delta_speed_distribution = Normal(delta_vel_mean, torch.sqrt(torch.clamp(delta_vel_var, min=1e-8)))
             delta_speed_sample = delta_speed_distribution.rsample()
             # delta_speed_sample = delta_vel_mean + torch.sqrt(delta_vel_var)*torch.randn(delta_vel_mean.shape, dtype=self.dtype, device=self.device)
         else:
@@ -855,7 +855,7 @@ class SP_Speed_Model_learning_Furuta(Model_learning):
 
         if particle_pred == True:
             # sample delta speed from distribution
-            delta_speed_distribution = Normal(delta_vel_mean, torch.sqrt(delta_vel_var))
+            delta_speed_distribution = Normal(delta_vel_mean, torch.sqrt(torch.clamp(delta_vel_var, min=1e-8)))
             delta_speed_sample = delta_speed_distribution.rsample()
             # delta_speed_sample = delta_vel_mean + torch.sqrt(delta_vel_var)*torch.randn(delta_vel_mean.shape, dtype=self.dtype, device=self.device)
         else:

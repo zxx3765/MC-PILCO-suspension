@@ -90,11 +90,11 @@ def saturated_distance_from_target(
 
     # normalize states and targets
     norm_states = active_states / lengthscales
-    norm_target = target_state / lengthscales
+    norm_target = target_state[active_dims] / lengthscales
     # get the square distance
     dist = torch.sum(norm_states**2, dim=2, keepdim=True)
-    dist = dist + torch.sum(norm_target**2, dim=1, keepdim=True).transpose(0, 1)
-    dist -= 2 * torch.matmul(norm_states, norm_target.transpose(dim0=0, dim1=1))
+    dist = dist + torch.sum(norm_target**2)
+    dist -= 2 * torch.matmul(norm_states, norm_target).unsqueeze(-1)
 
     cost = 1 - torch.exp(-dist)
 

@@ -12,6 +12,7 @@ import torch
 
 sys.path.append("..")
 import copy
+import os
 import pickle as pkl
 import time
 
@@ -169,6 +170,7 @@ class MC_PILCO(torch.nn.Module):
                     self.log_dict["state_samples_history"] = self.state_samples_history
                     self.log_dict["input_samples_history"] = self.input_samples_history
                     self.log_dict["noiseless_states_history"] = self.noiseless_states_history
+                    os.makedirs(self.log_path, exist_ok=True)
                     pkl.dump(self.log_dict, open(self.log_path + "/log.pkl", "wb"))
 
                 # get model learning performance

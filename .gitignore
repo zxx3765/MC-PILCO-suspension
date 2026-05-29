@@ -170,3 +170,5 @@ cython_debug/
 **/__pycache__/
 # results_tmp/
 # !results_tmp/.gitkeep
+
+results_tmp/*
