@@ -29,7 +29,7 @@ class Model:
         """
         self.fcn = fcn  # ODE of system dynamics
 
-    def rollout(self, s0, policy, T, dt, noise):
+    def rollout(self, s0, policy, T, dt, noise, road_profile=None):
         """
         Generate a rollout of length T (s)  with control inputs computed by 'policy' and applied with a sampling time 'dt'.
         'noise' defines the standard deviation of a Gaussian measurement noise.
@@ -37,6 +37,7 @@ class Model:
             policy: policy function
             T: length rollout (s)
             dt: sampling time (s)
+            road_profile: optional tuple (z_r_array, z_r_dot_array) for road disturbance
         """
         state_dim = len(s0)
         time = np.linspace(0, T, int(T / dt) + 1)
@@ -57,8 +58,12 @@ class Model:
             # get input
             u = np.array(policy(noisy_states[i, :], t))
             inputs[i, :] = u
-            # get state
-            odeint_out = odeint(self.fcn, states[i, :], [t, t + dt], args=(u,))
+            # get state with optional road disturbance
+            if road_profile is not None:
+                z_r, z_r_dot = road_profile[0][i], road_profile[1][i]
+                odeint_out = odeint(self.fcn, states[i, :], [t, t + dt], args=(u, z_r, z_r_dot))
+            else:
+                odeint_out = odeint(self.fcn, states[i, :], [t, t + dt], args=(u,))
             states[i + 1, :] = odeint_out[1]
             noisy_states[i + 1, :] = odeint_out[1] + np.random.randn(state_dim) * noise
 
@@ -84,7 +89,7 @@ class PMS_Model:
         self.fcn = fcn
         self.filtering_dict = filtering_dict
 
-    def rollout(self, s0, policy, T, dt, noise, vel_indeces, pos_indeces):
+    def rollout(self, s0, policy, T, dt, noise, vel_indeces, pos_indeces, road_profile=None):
         """
         Generate a rollout of length T (s) for the system defined by 'fcn' with
         control inputs computed by 'policy' and applied with a sampling time 'dt'.
@@ -95,6 +100,7 @@ class PMS_Model:
             policy: policy function
             T: length rollout (s)
             dt: sampling time (s)
+            road_profile: optional tuple (z_r_array, z_r_dot_array) for road disturbance
 
         """
         state_dim = len(s0)
@@ -119,8 +125,12 @@ class PMS_Model:
             # get input
             u = np.array(policy(meas_states[i, :], t))
             inputs[i, :] = u
-            # get state
-            odeint_out = odeint(self.fcn, states[i, :], [t, t + dt], args=(u,))
+            # get state with optional road disturbance
+            if road_profile is not None:
+                z_r, z_r_dot = road_profile[0][i], road_profile[1][i]
+                odeint_out = odeint(self.fcn, states[i, :], [t, t + dt], args=(u, z_r, z_r_dot))
+            else:
+                odeint_out = odeint(self.fcn, states[i, :], [t, t + dt], args=(u,))
             states[i + 1, :] = odeint_out[1]
             noisy_states[i + 1, :] = odeint_out[1] + np.random.randn(state_dim) * noise
 

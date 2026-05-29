@@ -19,6 +19,7 @@ import policy_learning.Cost_function as Cost_function
 import policy_learning.MC_PILCO as MC_PILCO
 import policy_learning.Policy as Policy
 import simulation_class.ode_systems as f_ode
+import simulation_class.road_profiles as road_profiles
 
 # 从命令行加载随机种子
 p = argparse.ArgumentParser("test quarter car suspension")
@@ -54,6 +55,12 @@ std_noise = 10 ** (-3)  # 测量噪声标准差
 std_list = std_noise * np.ones(state_dim)  # 所有状态维度的噪声
 fl_SOD_GP = True  # 是否在GP中使用数据子集(SOD)近似
 fl_reinforce_init_dist = "Gaussian"  # 初始分布 ['Gaussian','Uniform']
+
+# 路面配置
+use_road_input = True  # 是否使用路面输入
+road_type = "random"  # 路面类型 ['flat', 'sinusoidal', 'random', 'step', 'ramp']
+road_params = {"road_class": "C", "velocity": 20.0}  # 路面参数
+# road_params = {"amplitude": 0.05, "frequency": 1.0}
 
 print("\n---- 设置模型学习参数 ----")
 f_model_learning = ML.Speed_Model_learning_RBF_angle_state
@@ -141,6 +148,20 @@ mc_pilco = MC_PILCO.MC_PILCO(
     device=device,
 )
 
+print("\n---- 生成路面轮廓 ----")
+if use_road_input:
+    # 生成足够长的路面轨迹（覆盖探索和控制阶段）
+    max_time = max(T_exploration, T_control) * num_trials
+    time_array = np.arange(0, max_time + T_sampling, T_sampling)
+    z_r_array, z_r_dot_array = road_profiles.generate_road_profile(road_type, time_array, **road_params)
+    road_profile = (z_r_array, z_r_dot_array)
+    print(f"路面类型: {road_type}")
+    print(f"路面参数: {road_params}")
+    print(f"路面轨迹长度: {len(z_r_array)} 个采样点")
+else:
+    road_profile = None
+    print("未使用路面输入")
+
 print("\n---- 设置初始状态 ----")
 initial_state = np.array([0.0, 0.0, 0.0, 0.0])  # [z_s, z_s_dot, z_u, z_u_dot]
 initial_state_var = 1e-6 * np.ones(state_dim)
@@ -162,6 +183,38 @@ policy_optimization_dict["lr_list"] = [1e-2] * num_trials
 policy_optimization_dict["f_optimizer"] = "lambda p, lr : torch.optim.Adam(p, lr)"
 policy_optimization_dict["p_dropout_list"] = [0.05] * num_trials
 
+print("\n---- 保存测试配置 ----")
+MC_PILCO_init_dict = {}
+MC_PILCO_init_dict["T_sampling"] = T_sampling
+MC_PILCO_init_dict["state_dim"] = state_dim
+MC_PILCO_init_dict["input_dim"] = input_dim
+MC_PILCO_init_dict["ode_fun"] = ode_fun
+MC_PILCO_init_dict["f_model_learning"] = f_model_learning
+MC_PILCO_init_dict["model_learning_par"] = model_learning_par
+MC_PILCO_init_dict["f_rand_exploration_policy"] = f_rand_exploration_policy
+MC_PILCO_init_dict["rand_exploration_policy_par"] = rand_exploration_policy_par
+MC_PILCO_init_dict["f_control_policy"] = f_control_policy
+MC_PILCO_init_dict["control_policy_par"] = control_policy_par
+MC_PILCO_init_dict["f_cost_function"] = f_cost_function
+MC_PILCO_init_dict["cost_function_par"] = cost_function_par
+MC_PILCO_init_dict["std_meas_noise"] = std_list
+MC_PILCO_init_dict["dtype"] = dtype
+MC_PILCO_init_dict["device"] = device
+
+reinforce_param_dict = {}
+reinforce_param_dict["initial_state"] = initial_state
+reinforce_param_dict["initial_state_var"] = initial_state_var
+reinforce_param_dict["T_exploration"] = T_exploration
+reinforce_param_dict["T_control"] = T_control
+reinforce_param_dict["num_trials"] = num_trials
+reinforce_param_dict["model_optimization_opt_list"] = model_optimization_opt_list
+reinforce_param_dict["policy_optimization_dict"] = policy_optimization_dict
+
+config_log_dict = {}
+config_log_dict["MC_PILCO_init_dict"] = MC_PILCO_init_dict
+config_log_dict["reinforce_param_dict"] = reinforce_param_dict
+pkl.dump(config_log_dict, open(log_path + "/config_log.pkl", "wb"))
+
 print("\n---- 开始强化学习 ----")
 mc_pilco.reinforce(
     initial_state,
@@ -172,6 +225,7 @@ mc_pilco.reinforce(
     model_optimization_opt_list,
     policy_optimization_dict,
     flg_init_uniform=(fl_reinforce_init_dist == "Uniform"),
+    road_profile=road_profile,
 )
 
 print("\n---- 保存结果 ----")

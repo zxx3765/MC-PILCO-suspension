@@ -103,6 +103,7 @@ class MC_PILCO(torch.nn.Module):
         flg_init_multi_gauss=False,
         random_initial_state=True,
         loaded_model=False,
+        road_profile=None,
     ):
         """
         Model learning + policy learning method
@@ -130,6 +131,7 @@ class MC_PILCO(torch.nn.Module):
                     T_exploration=T_exploration,
                     flg_exploration=True,  # exploration interaction
                     trial_index=expl_index,
+                    road_profile=road_profile,
                 )
             cost_trial_list = []
             std_cost_trial_list = []
@@ -242,6 +244,7 @@ class MC_PILCO(torch.nn.Module):
                 T_exploration=T_control,
                 flg_exploration=False,  # control policy interaction
                 trial_index=trial_index + 1,
+                road_profile=road_profile,
             )
 
             if self.log_path is not None:
@@ -675,7 +678,7 @@ class MC_PILCO(torch.nn.Module):
         # returns states/inputs trajectories
         return torch.stack(states_sequence_list), torch.stack(inputs_sequence_list)
 
-    def get_data_from_system(self, initial_state, T_exploration, trial_index, flg_exploration=False):
+    def get_data_from_system(self, initial_state, T_exploration, trial_index, flg_exploration=False, road_profile=None):
         """
         Apply exploration/control policy to the system and collect interaction data
         """
@@ -692,6 +695,7 @@ class MC_PILCO(torch.nn.Module):
             T=T_exploration,
             dt=self.T_sampling,
             noise=self.std_meas_noise,
+            road_profile=road_profile,
         )
         self.state_samples_history.append(state_samples)
         self.input_samples_history.append(input_samples)
