@@ -125,13 +125,22 @@ class MC_PILCO(torch.nn.Module):
                 else:  # deterministic initial state
                     x0 = initial_state
 
+                # 提取当前trial对应的路面段
+                if road_profile is not None:
+                    start_idx = int(expl_index * T_exploration / self.T_sampling)
+                    num_samples = int(T_exploration / self.T_sampling) + 1
+                    end_idx = start_idx + num_samples
+                    road_segment = (road_profile[0][start_idx:end_idx], road_profile[1][start_idx:end_idx])
+                else:
+                    road_segment = None
+
                 # interact with the system
                 self.get_data_from_system(
                     initial_state=x0,
                     T_exploration=T_exploration,
                     flg_exploration=True,  # exploration interaction
                     trial_index=expl_index,
-                    road_profile=road_profile,
+                    road_profile=road_segment,
                 )
             cost_trial_list = []
             std_cost_trial_list = []
@@ -172,6 +181,7 @@ class MC_PILCO(torch.nn.Module):
                     self.log_dict["state_samples_history"] = self.state_samples_history
                     self.log_dict["input_samples_history"] = self.input_samples_history
                     self.log_dict["noiseless_states_history"] = self.noiseless_states_history
+                    self.log_dict["road_profile"] = road_profile
                     os.makedirs(self.log_path, exist_ok=True)
                     pkl.dump(self.log_dict, open(self.log_path + "/log.pkl", "wb"))
 
@@ -237,6 +247,17 @@ class MC_PILCO(torch.nn.Module):
             else:
                 x0 = initial_state
 
+            # 提取当前trial对应的路面段
+            if road_profile is not None:
+                # 控制阶段：trial_index从first_trial_index开始
+                # 对于标准情况(num_explorations=1)，first_trial_index=0表示第一个控制trial
+                start_idx = int(T_exploration / self.T_sampling) + int(trial_index * T_control / self.T_sampling)
+                num_samples = int(T_control / self.T_sampling) + 1
+                end_idx = start_idx + num_samples
+                road_segment = (road_profile[0][start_idx:end_idx], road_profile[1][start_idx:end_idx])
+            else:
+                road_segment = None
+
             print("\n\n----- APPLY THE CONTROL POLICY -----")
             # interact with the system
             self.get_data_from_system(
@@ -244,7 +265,7 @@ class MC_PILCO(torch.nn.Module):
                 T_exploration=T_control,
                 flg_exploration=False,  # control policy interaction
                 trial_index=trial_index + 1,
-                road_profile=road_profile,
+                road_profile=road_segment,
             )
 
             if self.log_path is not None:

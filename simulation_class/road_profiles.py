@@ -58,7 +58,10 @@ def sinusoidal_road(time_array, amplitude=0.05, frequency=1.0):
 
 def random_road(time_array, road_class="C", velocity=20.0, seed=None):
     """
-    随机路面 (基于ISO 8608功率谱密度)
+    随机路面 (基于ISO 8608功率谱密度，使用一阶成形滤波器)
+
+    微分方程: dZr/dt = 2*n0*pi*sqrt(G0*u)*w(t) - 2*pi*u*n1*Zr
+    其中 w(t) 是白噪声
 
     参数:
         road_class: 路面等级 ['A', 'B', 'C', 'D', 'E'] (默认: 'C' - 一般路面)
@@ -70,37 +73,28 @@ def random_road(time_array, road_class="C", velocity=20.0, seed=None):
 
     # ISO 8608 路面等级对应的粗糙度系数 Gq(n0) [10^-6 m^3]
     road_class_dict = {"A": 16, "B": 64, "C": 256, "D": 1024, "E": 4096}
-    Gq_n0 = road_class_dict.get(road_class, 256) * 1e-6
+    G0 = road_class_dict.get(road_class, 256) * 1e-6
 
     dt = time_array[1] - time_array[0]
     n_samples = len(time_array)
 
-    # 空间频率范围 [cycles/m]
+    # 空间频率参数 [cycles/m]
     n0 = 0.1  # 参考空间频率
-    n_min = 0.01
-    n_max = 10.0
+    n1 = 0.1  # 截止空间频率
 
-    # 生成频率域
-    df = 1.0 / (n_samples * dt * velocity)
-    freqs = np.fft.rfftfreq(n_samples, dt)
-    spatial_freqs = freqs / velocity
+    # 生成白噪声
+    white_noise = np.random.randn(n_samples)
 
-    # 功率谱密度
-    mask = (spatial_freqs >= n_min) & (spatial_freqs <= n_max)
-    Gq = np.zeros_like(spatial_freqs)
-    Gq[mask] = Gq_n0 * (spatial_freqs[mask] / n0) ** (-2)
+    # 时域积分：dZr/dt = 2*n0*pi*sqrt(G0*u)*w(t) - 2*pi*u*n1*Zr
+    z_r = np.zeros(n_samples)
+    z_r_dot = np.zeros(n_samples)
 
-    # 生成随机相位
-    phases = np.random.uniform(0, 2 * np.pi, len(freqs))
-    amplitudes = np.sqrt(2 * Gq * df * velocity)
+    for k in range(n_samples - 1):
+        z_r_dot[k] = 2 * np.pi * n0 * np.sqrt(G0 * velocity) * white_noise[k] - 2 * np.pi * velocity * n1 * z_r[k]
+        z_r[k + 1] = z_r[k] + dt * z_r_dot[k]
 
-    # 构造频域信号
-    spectrum = amplitudes * np.exp(1j * phases)
-    spectrum[0] = 0  # 去除直流分量
-
-    # 逆FFT得到时域信号
-    z_r = np.fft.irfft(spectrum, n=n_samples)
-    z_r_dot = np.gradient(z_r, dt)
+    # 最后一个点的速度
+    z_r_dot[-1] = 2 * np.pi * n0 * np.sqrt(G0 * velocity) * white_noise[-1] - 2 * np.pi * velocity * n1 * z_r[-1]
 
     return z_r, z_r_dot
 
