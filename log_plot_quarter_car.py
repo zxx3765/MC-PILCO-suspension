@@ -6,6 +6,7 @@ Plot obtained results from log files (quarter car suspension experiments)
 """
 
 import argparse
+import os
 import pickle as pkl
 
 import matplotlib.pyplot as plt
@@ -13,8 +14,8 @@ import numpy as np
 import torch
 
 # Configure matplotlib to support Chinese characters
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False  # Fix minus sign display
+plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False  # Fix minus sign display
 
 import gpr_lib.Likelihood.Gaussian_likelihood as Likelihood
 import gpr_lib.Utils.Parameters_covariance_functions as cov_func
@@ -28,12 +29,42 @@ from simulation_class.model import Model
 
 # file parameters
 p = argparse.ArgumentParser("plot log")
-p.add_argument("-dir_path", type=str, default="results_tmp/quarter_car_gym_seed", help="none")
-p.add_argument("-seed", type=int, default=1, help="none")
+p.add_argument("-dir_path", type=str, default="results_tmp/quarter_car_gym_seed", help="Legacy path prefix.")
+p.add_argument("-seed", type=int, default=1, help="Random seed.")
+p.add_argument("-result_root", type=str, default="results_tmp/quarter_car_gym", help="Grouped experiment root.")
+p.add_argument("-run_name", type=str, default=None, help="Configuration folder under seed_<seed>.")
+p.add_argument("-log_dir", type=str, default=None, help="Direct path to a run folder containing log.pkl.")
 
 # load parameters
 locals().update(vars(p.parse_known_args()[0]))
-file_name = dir_path + '_'+str(seed) + "/log.pkl"
+if log_dir is None:
+    if run_name is not None:
+        log_dir = os.path.join(result_root, "seed_" + str(seed), run_name)
+    else:
+        legacy_log_dir = dir_path + "_" + str(seed)
+        grouped_seed_dir = os.path.join(result_root, "seed_" + str(seed))
+        if os.path.isdir(grouped_seed_dir):
+            candidate_dirs = [
+                os.path.join(grouped_seed_dir, child)
+                for child in os.listdir(grouped_seed_dir)
+                if os.path.isfile(os.path.join(grouped_seed_dir, child, "log.pkl"))
+            ]
+            if len(candidate_dirs) == 1:
+                log_dir = candidate_dirs[0]
+            elif len(candidate_dirs) > 1:
+                raise ValueError(
+                    "seed_{} 下有多个实验，请用 -run_name 或 -log_dir 指定其中一个: {}".format(
+                        seed, ", ".join(os.path.basename(path) for path in candidate_dirs)
+                    )
+                )
+            else:
+                log_dir = legacy_log_dir
+        elif os.path.isfile(os.path.join(legacy_log_dir, "log.pkl")):
+            log_dir = legacy_log_dir
+        else:
+            log_dir = legacy_log_dir
+
+file_name = os.path.join(log_dir, "log.pkl")
 print("---- Reading log file: " + file_name)
 log_dict = pkl.load(open(file_name, "rb"))
 particles_states_list = log_dict["particles_states_list"]
@@ -47,7 +78,7 @@ saved_road_profile = log_dict.get("road_profile", None)
 gym_reset_kwargs_history = log_dict.get("gym_reset_kwargs_history", [])
 gym_initial_state_history = log_dict.get("gym_initial_state_history", [])
 
-config_log_dict = pkl.load(open(dir_path + '_' + str(seed) + "/config_log.pkl", "rb"))
+config_log_dict = pkl.load(open(os.path.join(log_dir, "config_log.pkl"), "rb"))
 MC_PILCO_init_dict = config_log_dict["MC_PILCO_init_dict"]
 f_cost_function = MC_PILCO_init_dict["f_cost_function"]
 cost_function_par = MC_PILCO_init_dict["cost_function_par"]
@@ -66,6 +97,67 @@ env_config = None
 gym_obs_scale = np.ones(4)
 gym_act_scale = 1.0
 gym_act_max = 1000.0
+
+
+def result_file(file_name):
+    return os.path.join(log_dir, file_name)
+
+
+def as_1d_array(values):
+    return np.asarray(values).reshape(-1)
+
+
+def root_mean_square(values):
+    values = as_1d_array(values)
+    return np.sqrt(np.mean(values**2))
+
+
+def peak_abs(values):
+    values = as_1d_array(values)
+    return np.max(np.abs(values))
+
+
+def response_text(active_values, passive_values=None):
+    text = "RMS={:.3g}\nPeak={:.3g}".format(root_mean_square(active_values), peak_abs(active_values))
+    if passive_values is not None:
+        passive_rms = root_mean_square(passive_values)
+        if passive_rms > 1e-12:
+            reduction = 100.0 * (passive_rms - root_mean_square(active_values)) / passive_rms
+            text += "\nRMS改善={:+.1f}%".format(reduction)
+    return text
+
+
+def get_road_segment(z_r_array, start_time_idx, end_time_idx, n_samples):
+    if z_r_array is None:
+        return np.zeros(n_samples)
+    road_segment = as_1d_array(z_r_array[start_time_idx:end_time_idx])
+    if len(road_segment) == n_samples:
+        return road_segment
+    if len(road_segment) == 0:
+        return np.zeros(n_samples)
+    return np.interp(np.linspace(0, len(road_segment) - 1, n_samples), np.arange(len(road_segment)), road_segment)
+
+
+def plot_response_axis(ax, time, active_values, passive_values, ylabel, active_color, show_legend=False):
+    if passive_values is not None:
+        ax.plot(time, passive_values, color="0.55", linestyle="--", linewidth=1.25, label="被动悬架")
+    ax.plot(time, active_values, color=active_color, linewidth=1.5, label="主动悬架")
+    ax.axhline(y=0, color="0.15", linestyle="--", linewidth=0.8, alpha=0.35)
+    ax.grid(True, alpha=0.28)
+    ax.set_ylabel(ylabel)
+    ax.text(
+        0.012,
+        0.96,
+        response_text(active_values, passive_values),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8.5,
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.8", alpha=0.85),
+    )
+    if show_legend:
+        ax.legend(loc="upper right", frameon=False, ncol=2)
+
 
 if not is_gym_env:
     # ODE环境：创建被动悬架模型和路面轮廓
@@ -91,6 +183,7 @@ if not is_gym_env:
 else:
     # Gym环境：重建环境用于被动悬架baseline
     import sys
+
     sys.path.append("D:\\Project\\GOPS")
     from gops.env.env_matlab.simu_quarter_sus_imp_force import SimuQuarterSusImpForce
     import simulation_class.gym_model as gym_model
@@ -136,7 +229,7 @@ for trial_index in range(0, num_trials):
     plt.ylabel("$\dot{z}_u$ [m/s]")
     plt.plot(np.zeros(len(state_samples[:, :, 3])), "r--")
     plt.plot(state_samples[:, :, 3])
-    plt.savefig(dir_path + '_' + str(seed) + "/" + "particles_rollout_trial" + str(trial_index) + ".pdf")
+    plt.savefig(result_file("particles_rollout_trial" + str(trial_index) + ".png"), dpi=300)
     plt.close()
 
     plt.figure()
@@ -152,7 +245,7 @@ for trial_index in range(0, num_trials):
     plt.plot(input_limit_plot * np.ones(len(input_samples[:, :, 0])), "r--")
     plt.plot(-input_limit_plot * np.ones(len(input_samples[:, :, 0])), "r--")
     plt.plot(input_samples_plot)
-    plt.savefig(dir_path + '_' + str(seed) + "/" + "particles_control_trial" + str(trial_index) + ".pdf")
+    plt.savefig(result_file("particles_control_trial" + str(trial_index) + ".png"), dpi=300)
     plt.close()
 
 trial_index_cost = [0] + list(range(num_trials))
@@ -202,8 +295,8 @@ for trial_index in range(0, num_trials + 1):
     if z_r_array is not None:
         plt.plot(z_r_array[start_time_idx:end_time_idx])
     else:
-        plt.text(0.5, 0.5, 'Gym环境\n路面由环境生成', ha='center', va='center', transform=plt.gca().transAxes)
-    plt.savefig(dir_path + '_' + str(seed) + "/" + "true_rollout_trial" + str(trial_index) + ".pdf")
+        plt.text(0.5, 0.5, "Gym环境\n路面由环境生成", ha="center", va="center", transform=plt.gca().transAxes)
+    plt.savefig(result_file("true_rollout_trial" + str(trial_index) + ".png"), dpi=300)
     plt.close()
 
     plt.figure()
@@ -220,7 +313,7 @@ for trial_index in range(0, num_trials + 1):
     plt.plot(input_limit_plot * np.ones(len(input_samples)), "r--")
     plt.plot(-input_limit_plot * np.ones(len(input_samples)), "r--")
     plt.plot(input_samples_plot)
-    plt.savefig(dir_path + '_' + str(seed) + "/" + "true_control_trial" + str(trial_index) + ".pdf")
+    plt.savefig(result_file("true_control_trial" + str(trial_index) + ".png"), dpi=300)
     plt.close()
 
     cost = (
@@ -241,7 +334,7 @@ for trial_index in range(0, num_trials + 1):
     plt.xlabel("time step")
     plt.plot(cost)
     plt.plot(np.zeros(len(state_samples[:, 0])), "r--")
-    plt.savefig(dir_path + '_' + str(seed) + "/" + "true_cost_trial" + str(trial_index) + ".pdf")
+    plt.savefig(result_file("true_cost_trial" + str(trial_index) + ".png"), dpi=300)
     plt.close()
 
     # 绘制悬架性能指标
@@ -281,7 +374,9 @@ for trial_index in range(0, num_trials + 1):
             # ODE环境：使用ODE模型
             initial_state = state_samples[0, :]
             road_profile_segment = (z_r_array[start_time_idx:end_time_idx], z_r_dot_array[start_time_idx:end_time_idx])
-            _, _, passive_states = passive_model.rollout(initial_state, passive_policy, T_duration, T_sampling, noise=0.0, road_profile=road_profile_segment)
+            _, _, passive_states = passive_model.rollout(
+                initial_state, passive_policy, T_duration, T_sampling, noise=0.0, road_profile=road_profile_segment
+            )
 
         # 计算被动悬架的关键性能指标
         if is_gym_env:
@@ -289,9 +384,10 @@ for trial_index in range(0, num_trials + 1):
             passive_suspension_travel = passive_states[:, 2] * gym_obs_scale[2]
             passive_tire_deflection = passive_states[:, 3] * gym_obs_scale[3]
         else:
+            road_segment = get_road_segment(z_r_array, start_time_idx, end_time_idx, len(passive_states))
             passive_suspension_travel = passive_states[:, 0] - passive_states[:, 2]
             passive_sprung_mass_accel = np.gradient(passive_states[:, 1], T_sampling)
-            passive_tire_deflection = passive_states[:, 2]
+            passive_tire_deflection = passive_states[:, 2] - road_segment
     else:
         # 无被动悬架baseline
         passive_suspension_travel = None
@@ -303,68 +399,117 @@ for trial_index in range(0, num_trials + 1):
         sprung_mass_accel = state_samples[:, 0] * gym_obs_scale[0]
         suspension_travel = state_samples[:, 2] * gym_obs_scale[2]
         tire_deflection = state_samples[:, 3] * gym_obs_scale[3]
-        tire_metric_label = "悬架相对速度 [m/s]"
-        control_force = input_samples[:, 0] / gym_act_scale
+        tire_metric_label = "轮胎动变形代理 $v_{def}$ [m/s]"
+        control_force = as_1d_array(input_samples[:, 0] / gym_act_scale)
         control_limit = gym_act_max
     else:
+        road_segment = get_road_segment(z_r_array, start_time_idx, end_time_idx, len(state_samples))
         suspension_travel = state_samples[:, 0] - state_samples[:, 2]  # z_s - z_u (悬架动行程)
         sprung_mass_accel = np.gradient(state_samples[:, 1], T_sampling)  # d(dot_z_s)/dt (簧上质量加速度)
-        tire_deflection = state_samples[:, 2]  # z_u (轮胎动变形，假设路面为零参考)
+        tire_deflection = state_samples[:, 2] - road_segment  # z_u - z_r (轮胎动变形)
         tire_metric_label = "轮胎动变形 [m]"
-        control_force = input_samples[:, 0]
+        control_force = as_1d_array(input_samples[:, 0])
         control_limit = 1000.0
 
-    plt.figure(figsize=(10, 12))
+    reward = -as_1d_array(cost)
+    cumulative_reward = np.cumsum(reward) * T_sampling
 
-    plt.subplot(5, 1, 1)
-    plt.title("悬架响应分析 - 试验: " + str(trial_index))
-    plt.grid()
-    plt.ylabel(r"簧上质量加速度 [m/s$^2$]")
-    if passive_sprung_mass_accel is not None:
-        plt.plot(time, passive_sprung_mass_accel, 'gray', linestyle='--', linewidth=1.5, alpha=0.7, label='被动悬架')
-    plt.plot(time, sprung_mass_accel, 'b-', linewidth=1.5, label='主动悬架')
-    plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
-    plt.legend(loc='upper right')
+    fig, axes = plt.subplots(
+        5,
+        1,
+        figsize=(11, 13),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.15, 1.0, 1.0, 0.9, 0.95]},
+        constrained_layout=True,
+    )
+    fig.suptitle(
+        "Suspension response trial {} | RMS: acc={:.3g} m/s$^2$, travel={:.3g} m, tire={:.3g}".format(
+            trial_index,
+            root_mean_square(sprung_mass_accel),
+            root_mean_square(suspension_travel),
+            root_mean_square(tire_deflection),
+        ),
+        fontsize=13,
+    )
 
-    plt.subplot(5, 1, 2)
-    plt.grid()
-    plt.ylabel("悬架动行程 [m]")
-    if passive_suspension_travel is not None:
-        plt.plot(time, passive_suspension_travel, 'gray', linestyle='--', linewidth=1.5, alpha=0.7, label='被动悬架')
-    plt.plot(time, suspension_travel, 'g-', linewidth=1.5, label='主动悬架')
-    plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
-    plt.legend(loc='upper right')
+    plot_response_axis(
+        axes[0],
+        time,
+        sprung_mass_accel,
+        passive_sprung_mass_accel,
+        r"簧上质量加速度 [m/s$^2$]",
+        "#1f77b4",
+        show_legend=True,
+    )
+    axes[0].set_title("Ride comfort / 车身垂向振动抑制", loc="left", fontsize=10)
 
-    plt.subplot(5, 1, 3)
-    plt.grid()
-    plt.ylabel(tire_metric_label)
-    if passive_tire_deflection is not None:
-        plt.plot(time, passive_tire_deflection, 'gray', linestyle='--', linewidth=1.5, alpha=0.7, label='被动悬架')
-    plt.plot(time, tire_deflection, 'r-', linewidth=1.5, label='主动悬架')
-    plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
-    plt.legend(loc='upper right')
+    plot_response_axis(
+        axes[1],
+        time,
+        suspension_travel,
+        passive_suspension_travel,
+        "悬架动行程 [m]",
+        "#2ca02c",
+    )
+    axes[1].set_title("Suspension working space / 悬架行程利用", loc="left", fontsize=10)
 
-    plt.subplot(5, 1, 4)
-    plt.grid()
-    plt.ylabel("路面高度 [m]")
-    if z_r_array is not None:
-        plt.plot(time, z_r_array[start_time_idx:end_time_idx], 'brown', linewidth=1.5)
-    else:
-        plt.text(0.5, 0.5, 'Gym环境', ha='center', va='center', transform=plt.gca().transAxes, fontsize=10, alpha=0.5)
-    plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    plot_response_axis(
+        axes[2],
+        time,
+        tire_deflection,
+        passive_tire_deflection,
+        tire_metric_label,
+        "#d62728",
+    )
+    axes[2].set_title("Road holding / 轮胎接地性", loc="left", fontsize=10)
 
-    plt.subplot(5, 1, 5)
-    plt.grid()
-    plt.ylabel("控制力 [N]")
-    plt.xlabel("时间 [s]")
-    plt.plot(time, control_force, 'k-', linewidth=1.5)
-    plt.axhline(y=control_limit, color='r', linestyle='--', alpha=0.5)
-    plt.axhline(y=-control_limit, color='r', linestyle='--', alpha=0.5)
-    plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[3].plot(time, control_force, color="0.1", linewidth=1.4, label="控制力")
+    axes[3].axhline(y=control_limit, color="#d62728", linestyle="--", linewidth=1.0, alpha=0.6)
+    axes[3].axhline(y=-control_limit, color="#d62728", linestyle="--", linewidth=1.0, alpha=0.6)
+    axes[3].axhline(y=0, color="0.15", linestyle="--", linewidth=0.8, alpha=0.35)
+    axes[3].grid(True, alpha=0.28)
+    axes[3].set_ylabel("控制力 [N]")
+    axes[3].set_title("Control effort / 主动控制输入", loc="left", fontsize=10)
+    axes[3].text(
+        0.012,
+        0.96,
+        "RMS={:.3g} N\nPeak={:.3g} N".format(root_mean_square(control_force), peak_abs(control_force)),
+        transform=axes[3].transAxes,
+        va="top",
+        ha="left",
+        fontsize=8.5,
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.8", alpha=0.85),
+    )
 
-    plt.tight_layout()
-    plt.savefig(dir_path + '_' + str(seed) + "/" + "suspension_response_trial" + str(trial_index) + ".pdf")
-    plt.close()
+    axes[4].plot(time, reward, color="#9467bd", linewidth=1.4, label="instant reward")
+    axes[4].fill_between(time, reward, 0, color="#9467bd", alpha=0.12)
+    axes[4].axhline(y=0, color="0.15", linestyle="--", linewidth=0.8, alpha=0.35)
+    axes[4].grid(True, alpha=0.28)
+    axes[4].set_ylabel("reward [-cost]")
+    axes[4].set_xlabel("时间 [s]")
+    axes[4].set_title("Reward trace / 瞬时收益与累计收益", loc="left", fontsize=10)
+    cumulative_axis = axes[4].twinx()
+    cumulative_axis.plot(time, cumulative_reward, color="#ff7f0e", linewidth=1.1, alpha=0.85, label="cumulative reward")
+    cumulative_axis.set_ylabel("累计reward")
+    axes[4].text(
+        0.012,
+        0.96,
+        "mean={:.3g}\nsum r*dt={:.3g}".format(np.mean(reward), cumulative_reward[-1]),
+        transform=axes[4].transAxes,
+        va="top",
+        ha="left",
+        fontsize=8.5,
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.8", alpha=0.85),
+    )
+
+    response_lines, response_labels = axes[4].get_legend_handles_labels()
+    cumulative_lines, cumulative_labels = cumulative_axis.get_legend_handles_labels()
+    axes[4].legend(
+        response_lines + cumulative_lines, response_labels + cumulative_labels, loc="lower right", frameon=False
+    )
+
+    fig.savefig(result_file("suspension_response_trial" + str(trial_index) + ".png"), dpi=300)
+    plt.close(fig)
 
     # 计算并存储RMS值
     rms_sprung_accel.append(np.sqrt(np.mean(sprung_mass_accel**2)))
@@ -376,30 +521,48 @@ plt.figure(figsize=(10, 10))
 trials = np.arange(len(rms_sprung_accel))
 
 plt.subplot(3, 1, 1)
-plt.plot(trials, rms_sprung_accel, 'b-o', linewidth=2, markersize=6)
-plt.ylabel(r'RMS [m/s$^2$]')
-plt.title('悬架性能指标 RMS 随训练的变化趋势')
+plt.plot(trials, rms_sprung_accel, "b-o", linewidth=2, markersize=6)
+plt.ylabel(r"RMS [m/s$^2$]")
+plt.title("悬架性能指标 RMS 随训练的变化趋势")
 plt.grid(True, alpha=0.3)
-plt.text(0.02, 0.95, '簧上质量加速度', transform=plt.gca().transAxes,
-         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+plt.text(
+    0.02,
+    0.95,
+    "簧上质量加速度",
+    transform=plt.gca().transAxes,
+    verticalalignment="top",
+    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+)
 
 plt.subplot(3, 1, 2)
-plt.plot(trials, rms_suspension_travel, 'g-s', linewidth=2, markersize=6)
-plt.ylabel('RMS [m]')
+plt.plot(trials, rms_suspension_travel, "g-s", linewidth=2, markersize=6)
+plt.ylabel("RMS [m]")
 plt.grid(True, alpha=0.3)
-plt.text(0.02, 0.95, '悬架动行程', transform=plt.gca().transAxes,
-         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+plt.text(
+    0.02,
+    0.95,
+    "悬架动行程",
+    transform=plt.gca().transAxes,
+    verticalalignment="top",
+    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+)
 
 plt.subplot(3, 1, 3)
-plt.plot(trials, rms_tire_deflection, 'r-^', linewidth=2, markersize=6)
-plt.xlabel('试验次数 (Trial)')
-plt.ylabel('RMS [m]')
+plt.plot(trials, rms_tire_deflection, "r-^", linewidth=2, markersize=6)
+plt.xlabel("试验次数 (Trial)")
+plt.ylabel("RMS [m]")
 plt.grid(True, alpha=0.3)
-plt.text(0.02, 0.95, '轮胎动变形', transform=plt.gca().transAxes,
-         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+plt.text(
+    0.02,
+    0.95,
+    "轮胎动变形",
+    transform=plt.gca().transAxes,
+    verticalalignment="top",
+    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+)
 
 plt.tight_layout()
-plt.savefig(dir_path + '_' + str(seed) + "/" + "rms_trend.pdf")
+plt.savefig(result_file("rms_trend.png"), dpi=300)
 plt.close()
 
 plt.figure()
@@ -413,5 +576,5 @@ for trial_index in range(0, num_trials):
 plt.xlabel("optimization steps")
 plt.ylabel("total rollout cost")
 plt.grid()
-plt.savefig(dir_path + '_' + str(seed) + "/" + "learning_plot.pdf")
+plt.savefig(result_file("learning_plot.png"), dpi=300)
 plt.close()

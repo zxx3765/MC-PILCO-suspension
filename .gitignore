@@ -172,3 +172,4 @@ cython_debug/
 # !results_tmp/.gitkeep
 
 results_tmp/*
+launcher_configs/*
