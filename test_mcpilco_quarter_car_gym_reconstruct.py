@@ -228,6 +228,7 @@ control_policy_par["input_dim"] = input_dim
 control_policy_par["num_basis"] = num_basis
 control_policy_par["flg_squash"] = True
 control_policy_par["u_max"] = u_max
+control_policy_par["weight_init"] = u_max * (np.random.rand(input_dim, control_policy_par["num_basis"]) - 0.5)
 control_policy_par["dtype"] = dtype
 control_policy_par["device"] = device
 
