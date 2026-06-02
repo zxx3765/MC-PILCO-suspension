@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """
-使用GOPS gym环境测试 MC-PILCO
+使用GOPS gym环境测试 MC-PILCO - 仅物理状态重构版本
 """
 
 import argparse
@@ -181,11 +181,12 @@ std_list = std_noise * np.ones(state_dim)  # 所有状态维度的噪声
 fl_SOD_GP = True  # 是否在GP中使用数据子集(SOD)近似
 
 print("\n---- 设置模型学习参数 ----")
-f_model_learning = ML.Model_learning_RBF_angle_state
+f_model_learning = ML.Model_learning_Quarter_Car_Gym_State_Reconstruction
 model_learning_par = {}
 model_learning_par["num_gp"] = num_gp
 model_learning_par["angle_indeces"] = []
 model_learning_par["not_angle_indeces"] = [0, 1, 2, 3]
+model_learning_par["obs_scaling"] = env_config["obs_scaling"]
 model_learning_par["device"] = device
 model_learning_par["dtype"] = dtype
 if fl_SOD_GP:
@@ -261,14 +262,14 @@ print("\n---- 初始化 MC-PILCO-Gym ----")
 resolved_run_name = (
     safe_path_name(run_name) if run_name else build_run_name(env_config, control_policy_par, policy_optimization_dict)
 )
-log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name)
+log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name + "_reconstruct")
 if os.path.isdir(log_path) and os.listdir(log_path) and not overwrite_existing:
     raise FileExistsError("结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path))
 os.makedirs(log_path, exist_ok=True)
 experiment_info = {
     "created_at": datetime.now().isoformat(timespec="seconds"),
     "seed": seed,
-    "run_name": resolved_run_name,
+    "run_name": resolved_run_name + "_reconstruct",
     "result_root": result_root,
     "log_path": log_path,
     "layout": "<result_root>/seed_<seed>/<run_name>/",

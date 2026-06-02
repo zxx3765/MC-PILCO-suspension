@@ -870,3 +870,214 @@ class SP_Speed_Model_learning_Furuta(Model_learning):
         )
 
         return next_states, delta_vel_mean, delta_vel_var
+
+
+class Model_learning_Quarter_Car_Gym_State_Reconstruction(Model_learning_RBF_angle_state):
+    """
+    Model learning class for Gym Quarter Car that reconstructs states.
+    GP inputs: [suspension_deflection, v_def, vs, vu, u]
+    GP outputs: [acc_s_change, vs_change, suspension_deflection_change, v_def_change]
+    """
+    def __init__(
+        self,
+        num_gp,
+        init_dict_list,
+        angle_indeces,
+        not_angle_indeces,
+        obs_scaling,
+        approximation_mode=None,
+        approximation_dict=None,
+        dtype=torch.float64,
+        device=torch.device("cpu"),
+        flg_norm=False,
+    ):
+        super(Model_learning_Quarter_Car_Gym_State_Reconstruction, self).__init__(
+            num_gp=num_gp,
+            init_dict_list=init_dict_list,
+            angle_indeces=angle_indeces,
+            not_angle_indeces=not_angle_indeces,
+            approximation_mode=approximation_mode,
+            approximation_dict=approximation_dict,
+            dtype=dtype,
+            device=device,
+            flg_norm=flg_norm,
+        )
+        self.obs_scaling = torch.tensor(obs_scaling, dtype=self.dtype, device=self.device)
+
+    def to(self, device):
+        super(Model_learning_Quarter_Car_Gym_State_Reconstruction, self).to(device)
+        self.obs_scaling = self.obs_scaling.to(device)
+
+    def data_to_gp_input(self, states, inputs):
+        """
+        unscales observations and reconstructs physical wheel velocity:
+        v_u = v_s - v_def
+        """
+        unscaled_states = states * self.obs_scaling
+        v_s = unscaled_states[:, 1:2]                  # sprung velocity
+        susp_def = unscaled_states[:, 2:3]             # suspension deflection
+        v_def = unscaled_states[:, 3:4]                # suspension deflection velocity
+        
+        # Reconstruct unsprung velocity
+        v_u = v_s - v_def
+        
+        # Reconstruct physical coordinate state vector
+        reconstructed_states = torch.cat([susp_def, v_def, v_s, v_u], dim=1)
+        
+        return torch.cat([reconstructed_states, inputs], dim=1)
+
+
+class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_state):
+    """
+    Model learning class for Gym Quarter Car that does physics-informed residual learning.
+    GP inputs: [suspension_deflection, v_def, vs, vu, u] (reconstructed physical coordinate space)
+    GP targets: delta_obs_observed - delta_obs_physics
+    """
+    def __init__(
+        self,
+        num_gp,
+        init_dict_list,
+        angle_indeces,
+        not_angle_indeces,
+        obs_scaling,
+        act_scaling,
+        T_sampling,
+        m_s,
+        m_u,
+        k_s,
+        c_s,
+        k_t,
+        c_t=0.0,
+        approximation_mode=None,
+        approximation_dict=None,
+        dtype=torch.float64,
+        device=torch.device("cpu"),
+        flg_norm=False,
+    ):
+        super(Model_learning_Quarter_Car_Gym_Physics_Residual, self).__init__(
+            num_gp=num_gp,
+            init_dict_list=init_dict_list,
+            angle_indeces=angle_indeces,
+            not_angle_indeces=not_angle_indeces,
+            approximation_mode=approximation_mode,
+            approximation_dict=approximation_dict,
+            dtype=dtype,
+            device=device,
+            flg_norm=flg_norm,
+        )
+        self.obs_scaling = torch.tensor(obs_scaling, dtype=self.dtype, device=self.device)
+        self.act_scaling = act_scaling
+        self.T_sampling = T_sampling
+        self.m_s = m_s
+        self.m_u = m_u
+        self.k_s = k_s
+        self.c_s = c_s
+        self.k_t = k_t
+        self.c_t = c_t
+
+    def to(self, device):
+        super(Model_learning_Quarter_Car_Gym_Physics_Residual, self).to(device)
+        self.obs_scaling = self.obs_scaling.to(device)
+
+    def data_to_gp_input(self, states, inputs):
+        """
+        unscales observations and reconstructs physical wheel velocity:
+        v_u = v_s - v_def
+        """
+        unscaled_states = states * self.obs_scaling
+        v_s = unscaled_states[:, 1:2]
+        susp_def = unscaled_states[:, 2:3]
+        v_def = unscaled_states[:, 3:4]
+        v_u = v_s - v_def
+        reconstructed_states = torch.cat([susp_def, v_def, v_s, v_u], dim=1)
+        return torch.cat([reconstructed_states, inputs], dim=1)
+
+    def get_physics_delta_obs(self, states, inputs):
+        """
+        Calculates nominal physical observation changes in scaled observation space over T_sampling
+        (Assuming z_r = 0, z_r_dot = 0)
+        """
+        unscaled_states = states * self.obs_scaling
+        acc_s = unscaled_states[:, 0:1]                 # physical sprung mass acceleration
+        v_s = unscaled_states[:, 1:2]                   # physical sprung mass velocity
+        susp_def = unscaled_states[:, 2:3]              # physical suspension deflection (z_s - z_u)
+        v_def = unscaled_states[:, 3:4]                 # physical deflection velocity (z_s_dot - z_u_dot)
+        
+        # Reconstruct physical wheel velocity
+        v_u = v_s - v_def
+        # Reconstruct physical wheel displacement (approximating z_s ≈ 0, so z_u ≈ -susp_def)
+        z_u = -susp_def
+        
+        # Physical force from action (Gym action is scaled, physical force = action / act_scaling)
+        u_phys = inputs[:, 0:1] / self.act_scaling
+        
+        # Calculate nominal physical suspension force
+        F_susp = self.k_s * susp_def + self.c_s * v_def
+        # Calculate nominal physical tire force (assuming z_r = 0, z_r_dot = 0)
+        # We assume F_tire = 0 as a baseline since tire deflection is tiny and oscillates around 0.
+        # This prevents massive fictitious forces when z_u is unknown.
+        F_tire = torch.zeros_like(susp_def)
+        
+        # Calculate nominal sprung and unsprung accelerations
+        z_s_ddot = (-F_susp + u_phys) / self.m_s
+        z_u_ddot = (F_susp - F_tire) / self.m_u
+        
+        # Calculate nominal changes over T_sampling in physical coordinates
+        delta_v_s = acc_s * self.T_sampling
+        delta_susp_def = v_def * self.T_sampling
+        delta_v_def = (acc_s - z_u_ddot) * self.T_sampling
+        
+        # Acceleration change is modeled as 0 in nominal dynamics
+        delta_acc_s = torch.zeros_like(acc_s)
+        
+        # Combine nominal physical changes
+        delta_phys_unscaled = torch.cat([delta_acc_s, delta_v_s, delta_susp_def, delta_v_def], dim=1)
+        
+        # Scale back to scaled observation space
+        return delta_phys_unscaled / self.obs_scaling
+
+    def data_to_gp_IO(self, states, inputs):
+        """
+        GP targets: observed scaled delta - nominal physics scaled delta
+        """
+        gp_inputs = self.data_to_gp_input(states, inputs)[:-1, :]
+        
+        # Observed differences in scaled observation space
+        observed_delta = states[1:] - states[:-1]
+        
+        # Nominal physics differences in scaled observation space
+        physics_delta = self.get_physics_delta_obs(states[:-1], inputs[:-1])
+        
+        # Residuals to be learned by GP
+        residuals = observed_delta - physics_delta
+        
+        # Split into list of outputs for each GP
+        gp_output_list = [residuals[:, i : i + 1] for i in range(self.num_gp)]
+        
+        return gp_inputs, gp_output_list
+
+    def get_next_state_from_gp_output(
+        self, current_state, current_input, gp_output_mean_list, gp_output_var_list, particle_pred=True
+    ):
+        """
+        Reconstructs the next observation by adding GP residual predictions back to nominal physical updates
+        """
+        # GP predicted residual change
+        residual_mean = torch.cat(gp_output_mean_list, dim=1)
+        residual_var = torch.cat(gp_output_var_list, dim=1)
+        
+        # Nominal physics change in scaled space
+        physics_delta = self.get_physics_delta_obs(current_state, current_input)
+        
+        # Total observation change in scaled space
+        delta_obs_mean = physics_delta + residual_mean
+        
+        if particle_pred == True:
+            delta_obs_distribution = Normal(delta_obs_mean, torch.sqrt(torch.clamp(residual_var, min=1e-8)))
+            delta_obs_sample = delta_obs_distribution.rsample()
+        else:
+            delta_obs_sample = delta_obs_mean
+            
+        next_states = current_state + delta_obs_sample
+        return next_states, delta_obs_mean, residual_var
+

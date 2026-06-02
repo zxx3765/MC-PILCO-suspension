@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """
-使用GOPS gym环境测试 MC-PILCO
+使用GOPS gym环境测试 MC-PILCO - 物理模型残差学习版本
 """
 
 import argparse
@@ -181,11 +181,20 @@ std_list = std_noise * np.ones(state_dim)  # 所有状态维度的噪声
 fl_SOD_GP = True  # 是否在GP中使用数据子集(SOD)近似
 
 print("\n---- 设置模型学习参数 ----")
-f_model_learning = ML.Model_learning_RBF_angle_state
+f_model_learning = ML.Model_learning_Quarter_Car_Gym_Physics_Residual
 model_learning_par = {}
 model_learning_par["num_gp"] = num_gp
 model_learning_par["angle_indeces"] = []
 model_learning_par["not_angle_indeces"] = [0, 1, 2, 3]
+model_learning_par["obs_scaling"] = env_config["obs_scaling"]
+model_learning_par["act_scaling"] = env_config["act_scaling"]
+model_learning_par["T_sampling"] = T_sampling
+model_learning_par["m_s"] = env_config["Ms"]
+model_learning_par["m_u"] = env_config["Mu"]
+model_learning_par["k_s"] = env_config["Ks"]
+model_learning_par["c_s"] = env_config["Cs"]
+model_learning_par["k_t"] = env_config["Kt"]
+model_learning_par["c_t"] = 0.0
 model_learning_par["device"] = device
 model_learning_par["dtype"] = dtype
 if fl_SOD_GP:
@@ -261,14 +270,14 @@ print("\n---- 初始化 MC-PILCO-Gym ----")
 resolved_run_name = (
     safe_path_name(run_name) if run_name else build_run_name(env_config, control_policy_par, policy_optimization_dict)
 )
-log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name)
+log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name + "_residual")
 if os.path.isdir(log_path) and os.listdir(log_path) and not overwrite_existing:
     raise FileExistsError("结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path))
 os.makedirs(log_path, exist_ok=True)
 experiment_info = {
     "created_at": datetime.now().isoformat(timespec="seconds"),
     "seed": seed,
-    "run_name": resolved_run_name,
+    "run_name": resolved_run_name + "_residual",
     "result_root": result_root,
     "log_path": log_path,
     "layout": "<result_root>/seed_<seed>/<run_name>/",
