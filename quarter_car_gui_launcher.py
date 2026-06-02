@@ -83,6 +83,7 @@ class Launcher(tk.Tk):
         self.plot_vars = {}
         self.overwrite_var = tk.BooleanVar(value=False)
         self.plot_after_train_var = tk.BooleanVar(value=True)
+        self.train_mode_var = tk.StringVar(value="Baseline")
 
         self._build_ui()
         self.refresh_config_list()
@@ -126,6 +127,9 @@ class Launcher(tk.Tk):
         ttk.Button(controls, text="启动训练", command=self.run_training).pack(side=tk.LEFT)
         ttk.Checkbutton(controls, text="训练后自动画图", variable=self.plot_after_train_var).pack(side=tk.LEFT, padx=12)
         ttk.Checkbutton(controls, text="允许覆盖已有目录", variable=self.overwrite_var).pack(side=tk.LEFT)
+        ttk.Label(controls, text=" 训练脚本:").pack(side=tk.LEFT, padx=(12, 4))
+        self.script_combo = ttk.Combobox(controls, textvariable=self.train_mode_var, values=["Baseline", "State Reconstruct", "Physics Residual"], width=18, state="readonly")
+        self.script_combo.pack(side=tk.LEFT)
         ttk.Button(controls, text="同步到画图参数", command=self.copy_train_to_plot).pack(side=tk.LEFT, padx=12)
         ttk.Button(controls, text="打开结果目录", command=self.open_train_folder).pack(side=tk.LEFT)
 
@@ -258,6 +262,7 @@ class Launcher(tk.Tk):
             "conda_env": self.conda_env.get(),
             "overwrite_existing": self.overwrite_var.get(),
             "plot_after_train": self.plot_after_train_var.get(),
+            "train_mode": self.train_mode_var.get(),
             "train": {key: var.get() for key, var in self.train_vars.items()},
             "plot": {key: var.get() for key, var in self.plot_vars.items()},
         }
@@ -269,6 +274,8 @@ class Launcher(tk.Tk):
             self.overwrite_var.set(bool(data["overwrite_existing"]))
         if "plot_after_train" in data:
             self.plot_after_train_var.set(bool(data["plot_after_train"]))
+        if "train_mode" in data:
+            self.train_mode_var.set(data["train_mode"])
         for key, value in data.get("train", {}).items():
             if key in self.train_vars:
                 self.train_vars[key].set(str(value))
@@ -304,7 +311,14 @@ class Launcher(tk.Tk):
 
     def run_training(self):
         self.copy_train_to_plot()
-        command = self._python_command(TRAIN_SCRIPT)
+        mode = self.train_mode_var.get()
+        if mode == "State Reconstruct":
+            script = "test_mcpilco_quarter_car_gym_reconstruct.py"
+        elif mode == "Physics Residual":
+            script = "test_mcpilco_quarter_car_gym_residual.py"
+        else:
+            script = "test_mcpilco_quarter_car_gym.py"
+        command = self._python_command(script)
         command.extend(self._fields_to_args(TRAIN_FIELDS, self.train_vars))
         if self.overwrite_var.get():
             command.append("-overwrite_existing")
@@ -325,6 +339,11 @@ class Launcher(tk.Tk):
         for key in ("seed", "result_root", "run_name"):
             if key in self.train_vars and key in self.plot_vars:
                 self.plot_vars[key].set(self.train_vars[key].get())
+        mode = self.train_mode_var.get()
+        if mode == "State Reconstruct":
+            self.plot_vars["run_name"].set(self.train_vars["run_name"].get() + "_reconstruct")
+        elif mode == "Physics Residual":
+            self.plot_vars["run_name"].set(self.train_vars["run_name"].get() + "_residual")
 
     def choose_plot_log_dir(self):
         folder = filedialog.askdirectory(initialdir=WORKSPACE)
@@ -335,6 +354,11 @@ class Launcher(tk.Tk):
         result_root = self.train_vars["result_root"].get().strip()
         seed = self.train_vars["seed"].get().strip()
         run_name = self.train_vars["run_name"].get().strip()
+        mode = self.train_mode_var.get()
+        if mode == "State Reconstruct":
+            run_name += "_reconstruct"
+        elif mode == "Physics Residual":
+            run_name += "_residual"
         return os.path.join(WORKSPACE, result_root, "seed_" + seed, run_name)
 
     def plot_folder(self):
