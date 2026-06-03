@@ -24,7 +24,12 @@ import simulation_class.road_profiles as road_profiles
 # 从命令行加载随机种子
 p = argparse.ArgumentParser("test quarter car suspension")
 p.add_argument("-seed", type=int, default=1, help="seed")
+p.add_argument("-cost_l0", type=float, default=1.0, help="Cost function lengthscale for sprung acceleration.")
+p.add_argument("-cost_l1", type=float, default=0.1, help="Cost function lengthscale for sprung velocity.")
+p.add_argument("-cost_l2", type=float, default=1.0, help="Cost function lengthscale for suspension deflection.")
+p.add_argument("-cost_l3", type=float, default=1.0, help="Cost function lengthscale for deflection velocity.")
 locals().update(vars(p.parse_known_args()[0]))
+
 
 # 设置随机种子
 torch.manual_seed(seed)
@@ -124,7 +129,7 @@ cost_function_par = {}
 # 目标状态: 最小化车身加速度和悬架变形
 cost_function_par["target_state"] = torch.zeros(state_dim, dtype=dtype, device=device)
 # 长度尺度: 控制每个状态维度的惩罚程度 (较小的值 = 更大的惩罚)
-cost_function_par["lengthscales"] = torch.tensor([1.0, 0.1, 1.0, 1.0], dtype=dtype, device=device)
+cost_function_par["lengthscales"] = torch.tensor([cost_l0, cost_l1, cost_l2, cost_l3], dtype=dtype, device=device)
 # 活跃维度: 所有状态维度都参与代价计算
 cost_function_par["active_dims"] = np.arange(state_dim)
 

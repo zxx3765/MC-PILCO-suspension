@@ -138,6 +138,48 @@ def get_road_segment(z_r_array, start_time_idx, end_time_idx, n_samples):
     return np.interp(np.linspace(0, len(road_segment) - 1, n_samples), np.arange(len(road_segment)), road_segment)
 
 
+def replay_gym_env(env, initial_state, reset_kwargs, actions, length):
+    """
+    Replay a gym environment deterministically given initial state, reset kwargs, and actions.
+    Returns:
+        sprung_mass_accel, suspension_travel, tire_deflection (each is a 1D numpy array of shape (length,))
+    """
+    reset_call_kwargs = dict(reset_kwargs or {})
+    reset_args = getattr(env.reset, "__code__", None)
+    if reset_args is not None and "init_state" in reset_args.co_varnames:
+        reset_call_kwargs.setdefault("init_state", initial_state)
+
+    try:
+        reset_result = env.reset(**reset_call_kwargs)
+    except TypeError:
+        if reset_args is not None and "init_state" in reset_args.co_varnames:
+            reset_result = env.reset(init_state=initial_state)
+        else:
+            reset_result = env.reset()
+
+    # Get initial values from env's internal model info
+    try:
+        init_info = list(env.env.model_class.quarter_sus_imp_force_Y.info)
+    except AttributeError:
+        init_info = [0.0] * 8
+
+    sprung_accel = [init_info[6]]
+    suspension_travel = [init_info[0]]
+    tire_deflection = [init_info[4]]
+
+    for k in range(length - 1):
+        action = actions[k] if k < len(actions) else np.array([0.0])
+        step_result = env.step(action)
+        info_dict = step_result[-1]
+        info_arr = info_dict.get("info", [0.0] * 8)
+
+        sprung_accel.append(info_arr[6])
+        suspension_travel.append(info_arr[0])
+        tire_deflection.append(info_arr[4])
+
+    return np.array(sprung_accel), np.array(suspension_travel), np.array(tire_deflection)
+
+
 def plot_response_axis(ax, time, active_values, passive_values, ylabel, active_color, show_legend=False):
     if passive_values is not None:
         ax.plot(time, passive_values, color="0.55", linestyle="--", linewidth=1.25, label="被动悬架")
@@ -186,6 +228,7 @@ else:
 
     sys.path.append("D:\\Project\\GOPS")
     from gops.env.env_matlab.simu_quarter_sus_imp_force import SimuQuarterSusImpForce
+
     import simulation_class.gym_model as gym_model
 
     reinforce_param_dict = config_log_dict["reinforce_param_dict"]
@@ -362,14 +405,18 @@ for trial_index in range(0, num_trials + 1):
                 initial_state = state_samples[0, :]
                 print("警告：日志缺少Gym物理初始状态，被动baseline可能无法严格对齐")
             reset_kwargs = gym_reset_kwargs_history[trial_index] if len(gym_reset_kwargs_history) > trial_index else {}
-            _, _, passive_states = passive_model.rollout(
-                initial_state,
-                passive_policy,
-                T_duration,
-                T_sampling,
-                noise=0.0,
-                reset_kwargs=reset_kwargs,
-            )
+
+            # 构造无控制输入的 passive_actions (全0)
+            passive_actions = np.zeros((len(state_samples), 1))
+            if gym_env is not None:
+                passive_sprung_mass_accel, passive_suspension_travel, passive_tire_deflection = replay_gym_env(
+                    gym_env, initial_state, reset_kwargs, passive_actions, len(state_samples)
+                )
+            else:
+                passive_sprung_mass_accel = np.zeros(len(state_samples))
+                passive_suspension_travel = np.zeros(len(state_samples))
+                passive_tire_deflection = np.zeros(len(state_samples))
+                print("警告：未找到 gym_env，被动悬架指标设为0")
         else:
             # ODE环境：使用ODE模型
             initial_state = state_samples[0, :]
@@ -377,13 +424,7 @@ for trial_index in range(0, num_trials + 1):
             _, _, passive_states = passive_model.rollout(
                 initial_state, passive_policy, T_duration, T_sampling, noise=0.0, road_profile=road_profile_segment
             )
-
-        # 计算被动悬架的关键性能指标
-        if is_gym_env:
-            passive_sprung_mass_accel = passive_states[:, 0] * gym_obs_scale[0]
-            passive_suspension_travel = passive_states[:, 2] * gym_obs_scale[2]
-            passive_tire_deflection = passive_states[:, 3] * gym_obs_scale[3]
-        else:
+            # 计算被动悬架的关键性能指标
             road_segment = get_road_segment(z_r_array, start_time_idx, end_time_idx, len(passive_states))
             passive_suspension_travel = passive_states[:, 0] - passive_states[:, 2]
             passive_sprung_mass_accel = np.gradient(passive_states[:, 1], T_sampling)
@@ -396,10 +437,23 @@ for trial_index in range(0, num_trials + 1):
 
     # 计算主动悬架的关键性能指标
     if is_gym_env:
-        sprung_mass_accel = state_samples[:, 0] * gym_obs_scale[0]
-        suspension_travel = state_samples[:, 2] * gym_obs_scale[2]
-        tire_deflection = state_samples[:, 3] * gym_obs_scale[3]
-        tire_metric_label = "轮胎动变形代理 $v_{def}$ [m/s]"
+        if gym_env is not None:
+            if len(gym_initial_state_history) > trial_index:
+                initial_state = np.asarray(gym_initial_state_history[trial_index])
+            else:
+                initial_state = state_samples[0, :]
+            reset_kwargs = gym_reset_kwargs_history[trial_index] if len(gym_reset_kwargs_history) > trial_index else {}
+
+            sprung_mass_accel, suspension_travel, tire_deflection = replay_gym_env(
+                gym_env, initial_state, reset_kwargs, input_samples, len(state_samples)
+            )
+        else:
+            sprung_mass_accel = state_samples[:, 0] * gym_obs_scale[0]
+            suspension_travel = state_samples[:, 2] * gym_obs_scale[2]
+            tire_deflection = state_samples[:, 3] * gym_obs_scale[3]
+            print("警告：未找到 gym_env，使用观测值作为备用指标")
+
+        tire_metric_label = "轮胎动变形 [m]"
         control_force = as_1d_array(input_samples[:, 0] / gym_act_scale)
         control_limit = gym_act_max
     else:
@@ -411,15 +465,81 @@ for trial_index in range(0, num_trials + 1):
         control_force = as_1d_array(input_samples[:, 0])
         control_limit = 1000.0
 
+    # 提取/推导悬架评价代价的参数
+    # w_acc, w_tire, w_barrier 分别代表舒适、接地和安全屏障的权重
+    # l_acc, l_tire, d_barrier, beta 分别是对应的物理尺度
+    w_acc = 0.4
+    w_tire = 0.4
+    w_barrier = 0.2
+    l_acc = 1.5
+    l_tire = 0.006
+    d_barrier = 0.035
+    beta = 150.0
+
+    # 尝试从已保存的 cost_function 中提取参数
+    if hasattr(cost_function, "w_acc"):
+        w_acc = getattr(cost_function, "w_acc", w_acc)
+        w_tire = getattr(cost_function, "w_tire", w_tire)
+        w_barrier = getattr(cost_function, "w_barrier", w_barrier)
+        l_acc = getattr(cost_function, "l_acc", l_acc)
+        l_tire = getattr(cost_function, "l_tire", l_tire)
+        d_barrier = getattr(cost_function, "d_barrier", d_barrier)
+        beta = getattr(cost_function, "beta", beta)
+    else:
+        # 如果是 legacy 饱和距离代价函数，看看是不是能从 config_log_dict 中提取 lengthscales
+        key_params = config_log_dict.get("experiment_info", {}).get("key_parameters", {})
+        if "cost_l0" in key_params:
+            l_acc = key_params["cost_l0"]
+        if "cost_l2" in key_params:
+            l_tire = key_params["cost_l2"]
+
+        if "lengthscales" in cost_function_par:
+            try:
+                l_vals = cost_function_par["lengthscales"]
+                if isinstance(l_vals, torch.Tensor):
+                    l_vals = l_vals.cpu().numpy()
+                l_vals = np.atleast_1d(l_vals)
+                if len(l_vals) >= 3:
+                    l_acc = float(l_vals[0])
+                    l_tire = float(l_vals[2])
+            except Exception:
+                pass
+
+    # 计算主动悬架的评价代价分项
+    c_acc = 1.0 - np.exp(-((sprung_mass_accel / l_acc) ** 2))
+    c_tire = 1.0 - np.exp(-((tire_deflection / l_tire) ** 2))
+    c_barrier = 1.0 / (1.0 + np.exp(-beta * (np.abs(suspension_travel) - d_barrier)))
+
+    cost_comfort = w_acc * c_acc
+    cost_road_holding = w_tire * c_tire
+    cost_safety = w_barrier * c_barrier
+    cost_total = cost_comfort + cost_road_holding + cost_safety
+
+    # 计算被动悬架的评价代价分项
+    if passive_sprung_mass_accel is not None:
+        passive_c_acc = 1.0 - np.exp(-((passive_sprung_mass_accel / l_acc) ** 2))
+        passive_c_tire = 1.0 - np.exp(-((passive_tire_deflection / l_tire) ** 2))
+        passive_c_barrier = 1.0 / (1.0 + np.exp(-beta * (np.abs(passive_suspension_travel) - d_barrier)))
+
+        passive_cost_comfort = w_acc * passive_c_acc
+        passive_cost_road_holding = w_tire * passive_c_tire
+        passive_cost_safety = w_barrier * passive_c_barrier
+        passive_cost_total = passive_cost_comfort + passive_cost_road_holding + passive_cost_safety
+    else:
+        passive_cost_total = None
+        passive_cost_comfort = None
+        passive_cost_road_holding = None
+        passive_cost_safety = None
+
     reward = -as_1d_array(cost)
     cumulative_reward = np.cumsum(reward) * T_sampling
 
     fig, axes = plt.subplots(
-        5,
+        7,
         1,
-        figsize=(11, 13),
+        figsize=(11, 19),
         sharex=True,
-        gridspec_kw={"height_ratios": [1.15, 1.0, 1.0, 0.9, 0.95]},
+        gridspec_kw={"height_ratios": [1.15, 1.0, 1.0, 0.9, 0.95, 0.95, 0.95]},
         constrained_layout=True,
     )
     fig.suptitle(
@@ -481,20 +601,39 @@ for trial_index in range(0, num_trials + 1):
         bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.8", alpha=0.85),
     )
 
-    axes[4].plot(time, reward, color="#9467bd", linewidth=1.4, label="instant reward")
-    axes[4].fill_between(time, reward, 0, color="#9467bd", alpha=0.12)
+    # 4. Total Evaluation Cost Subplot
+    if passive_cost_total is not None:
+        axes[4].plot(time, passive_cost_total, color="0.55", linestyle="--", linewidth=1.25, label="被动悬架综合代价")
+    axes[4].plot(time, cost_total, color="#9467bd", linewidth=1.4, label="主动悬架综合代价")
+    axes[4].fill_between(time, cost_total, 0, color="#9467bd", alpha=0.10)
     axes[4].axhline(y=0, color="0.15", linestyle="--", linewidth=0.8, alpha=0.35)
     axes[4].grid(True, alpha=0.28)
-    axes[4].set_ylabel("reward [-cost]")
-    axes[4].set_xlabel("时间 [s]")
-    axes[4].set_title("Reward trace / 瞬时收益与累计收益", loc="left", fontsize=10)
-    cumulative_axis = axes[4].twinx()
-    cumulative_axis.plot(time, cumulative_reward, color="#ff7f0e", linewidth=1.1, alpha=0.85, label="cumulative reward")
-    cumulative_axis.set_ylabel("累计reward")
+    axes[4].set_ylabel("综合代价 cost")
+    axes[4].set_title("Total evaluation cost / 综合评价代价", loc="left", fontsize=10)
+
+    cumulative_cost_active = np.cumsum(cost_total) * T_sampling
+    cumulative_cost_axis = axes[4].twinx()
+    cumulative_cost_axis.plot(time, cumulative_cost_active, color="#ff7f0e", linewidth=1.1, alpha=0.85, label="主动累计代价")
+
+    if passive_cost_total is not None:
+        cumulative_cost_passive = np.cumsum(passive_cost_total) * T_sampling
+        cumulative_cost_axis.plot(
+            time, cumulative_cost_passive, color="0.45", linestyle=":", linewidth=1.1, alpha=0.7, label="被动累计代价"
+        )
+
+    cumulative_cost_axis.set_ylabel("累计cost")
+
+    cost_text = "Mean Active={:.3g}".format(np.mean(cost_total))
+    if passive_cost_total is not None:
+        cost_text += "\nMean Passive={:.3g}".format(np.mean(passive_cost_total))
+        passive_mean = np.mean(passive_cost_total)
+        if passive_mean > 1e-12:
+            cost_reduction = 100.0 * (passive_mean - np.mean(cost_total)) / passive_mean
+            cost_text += "\n代价改善={:+.1f}%".format(cost_reduction)
     axes[4].text(
         0.012,
         0.96,
-        "mean={:.3g}\nsum r*dt={:.3g}".format(np.mean(reward), cumulative_reward[-1]),
+        cost_text,
         transform=axes[4].transAxes,
         va="top",
         ha="left",
@@ -502,9 +641,51 @@ for trial_index in range(0, num_trials + 1):
         bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.8", alpha=0.85),
     )
 
-    response_lines, response_labels = axes[4].get_legend_handles_labels()
+    cost_lines, cost_labels = axes[4].get_legend_handles_labels()
+    cum_cost_lines, cum_cost_labels = cumulative_cost_axis.get_legend_handles_labels()
+    axes[4].legend(cost_lines + cum_cost_lines, cost_labels + cum_cost_labels, loc="upper right", frameon=False, ncol=2)
+
+    # 5. Component Evaluation Costs Subplot
+    axes[5].plot(time, cost_comfort, color="#1f77b4", linewidth=1.3, label="舒适性代价 $w_{acc}c_{acc}$")
+    axes[5].plot(time, cost_road_holding, color="#d62728", linewidth=1.3, label="接地性代价 $w_{tire}c_{tire}$")
+    axes[5].plot(time, cost_safety, color="#2ca02c", linewidth=1.3, label="限位安全代价 $w_{barrier}c_{barrier}$")
+
+    if passive_cost_total is not None:
+        axes[5].plot(time, passive_cost_comfort, color="#1f77b4", linestyle=":", linewidth=1.0, alpha=0.5)
+        axes[5].plot(time, passive_cost_road_holding, color="#d62728", linestyle=":", linewidth=1.0, alpha=0.5)
+        axes[5].plot(time, passive_cost_safety, color="#2ca02c", linestyle=":", linewidth=1.0, alpha=0.5)
+
+    axes[5].axhline(y=0, color="0.15", linestyle="--", linewidth=0.8, alpha=0.35)
+    axes[5].grid(True, alpha=0.28)
+    axes[5].set_ylabel("分项代价 cost")
+    axes[5].set_title("Component evaluation costs / 各分项评价代价", loc="left", fontsize=10)
+    axes[5].legend(loc="upper right", frameon=False, ncol=3, fontsize=8.5)
+
+    # 6. Reward trace (Original reward subplot)
+    axes[6].plot(time, reward, color="#2ca02c", linewidth=1.4, label="instant reward")
+    axes[6].fill_between(time, reward, 0, color="#2ca02c", alpha=0.12)
+    axes[6].axhline(y=0, color="0.15", linestyle="--", linewidth=0.8, alpha=0.35)
+    axes[6].grid(True, alpha=0.28)
+    axes[6].set_ylabel("reward [-cost]")
+    axes[6].set_xlabel("时间 [s]")
+    axes[6].set_title("Reward trace / 瞬时收益与累计收益", loc="left", fontsize=10)
+    cumulative_axis = axes[6].twinx()
+    cumulative_axis.plot(time, cumulative_reward, color="#ff7f0e", linewidth=1.1, alpha=0.85, label="cumulative reward")
+    cumulative_axis.set_ylabel("累计reward")
+    axes[6].text(
+        0.012,
+        0.96,
+        "mean={:.3g}\nsum r*dt={:.3g}".format(np.mean(reward), cumulative_reward[-1]),
+        transform=axes[6].transAxes,
+        va="top",
+        ha="left",
+        fontsize=8.5,
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.8", alpha=0.85),
+    )
+
+    response_lines, response_labels = axes[6].get_legend_handles_labels()
     cumulative_lines, cumulative_labels = cumulative_axis.get_legend_handles_labels()
-    axes[4].legend(
+    axes[6].legend(
         response_lines + cumulative_lines, response_labels + cumulative_labels, loc="lower right", frameon=False
     )
 

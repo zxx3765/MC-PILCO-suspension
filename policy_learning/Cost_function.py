@@ -180,3 +180,58 @@ def cart_pole_cost(states_sequence, inputs_sequence, trial_index, target_state, 
     return 1 - torch.exp(
         -(((torch.abs(theta) - target_theta) / lengthscales[0]) ** 2) - ((x - target_x) / lengthscales[1]) ** 2
     )
+
+
+class Expected_suspension_evaluation_cost(Expected_cost):
+    """
+    Cost function designed for real-world suspension evaluation criteria.
+    It penalizes sprung mass acceleration, tire deflection, and enforces a safety barrier on suspension travel.
+    """
+
+    def __init__(self, w_acc, w_tire, w_barrier, l_acc, l_tire, d_barrier, beta, obs_scaling):
+        self.w_acc = w_acc
+        self.w_tire = w_tire
+        self.w_barrier = w_barrier
+        self.l_acc = l_acc
+        self.l_tire = l_tire
+        self.d_barrier = d_barrier
+        self.beta = beta
+        self.obs_scaling = obs_scaling
+
+        f_cost = lambda x, u, trial_index: suspension_evaluation_cost(
+            x,
+            u,
+            trial_index,
+            w_acc=w_acc,
+            w_tire=w_tire,
+            w_barrier=w_barrier,
+            l_acc=l_acc,
+            l_tire=l_tire,
+            d_barrier=d_barrier,
+            beta=beta,
+            obs_scaling=obs_scaling,
+        )
+        super(Expected_suspension_evaluation_cost, self).__init__(f_cost)
+
+
+def suspension_evaluation_cost(
+    states_sequence, inputs_sequence, trial_index, w_acc, w_tire, w_barrier, l_acc, l_tire, d_barrier, beta, obs_scaling
+):
+    """
+    Computes comfort, road holding, and safety barrier cost components.
+    """
+    # obs_scaling = [5.0, 1.0, 0.03, 0.3]
+    # states_sequence: [num_instants, num_particles, state_dim]
+    acc_s = states_sequence[:, :, 0] * obs_scaling[0]
+    travel = states_sequence[:, :, 2] * obs_scaling[2]
+    tire = states_sequence[:, :, 3] * obs_scaling[3]
+
+    c_acc = 1.0 - torch.exp(-((acc_s / l_acc) ** 2))
+    c_tire = 1.0 - torch.exp(-((tire / l_tire) ** 2))
+
+    # Sigmoid barrier for travel deflection
+    c_barrier = 1.0 / (1.0 + torch.exp(-beta * (torch.abs(travel) - d_barrier)))
+
+    total_cost = w_acc * c_acc + w_tire * c_tire + w_barrier * c_barrier
+    return total_cost.unsqueeze(-1)
+

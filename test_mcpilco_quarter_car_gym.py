@@ -85,7 +85,22 @@ p.add_argument("-punish_Q_delta_F", type=float, default=5.0, help="Reward weight
 p.add_argument("-punish_Q_flec_t", type=float, default=1.0, help="Reward weight for tire deflection.")
 p.add_argument("-punish_Q_acc_s_h", type=float, default=2.5, help="High-frequency sprung-acceleration reward weight.")
 p.add_argument("-punish_Q_b_defelc", type=float, default=-80.0, help="Reward barrier weight for deflection.")
+p.add_argument("-cost_l0", type=float, default=1.0, help="Cost function lengthscale for sprung acceleration.")
+p.add_argument("-cost_l1", type=float, default=0.1, help="Cost function lengthscale for sprung velocity.")
+p.add_argument("-cost_l2", type=float, default=1.0, help="Cost function lengthscale for suspension deflection.")
+p.add_argument("-cost_l3", type=float, default=1.0, help="Cost function lengthscale for deflection velocity.")
+p.add_argument("-use_suspension_cost", action="store_true", help="Use the new physics-aligned suspension evaluation cost function.")
+p.add_argument("-w_acc", type=float, default=0.4, help="Comfort weight.")
+p.add_argument("-w_tire", type=float, default=0.4, help="Road holding weight.")
+p.add_argument("-w_barrier", type=float, default=0.2, help="Safety barrier weight.")
+p.add_argument("-l_acc", type=float, default=1.5, help="Comfort acceleration scale.")
+p.add_argument("-l_tire", type=float, default=0.006, help="Tire deflection scale.")
+p.add_argument("-d_barrier", type=float, default=0.035, help="Safety barrier displacement threshold.")
+p.add_argument("-beta_barrier", type=float, default=150.0, help="Safety barrier steepness coefficient.")
+p.add_argument("-device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Computation device (cpu or cuda)")
+p.add_argument("-num_threads", type=int, default=4, help="Number of CPU threads for PyTorch")
 locals().update(vars(p.parse_known_args()[0]))
+
 
 
 def safe_path_name(value):
@@ -121,10 +136,13 @@ np.random.seed(seed)
 dtype = torch.float64
 
 # 设置设备
-device = torch.device("cpu")
+device = torch.device(device)
+if device.type == "cuda" and not torch.cuda.is_available():
+    print("\n[WARNING] CUDA is specified but not available in this PyTorch installation.")
+    print("Please make sure PyTorch is installed with CUDA support. Falling back to CPU for now.")
+    device = torch.device("cpu")
 
 # 设置计算线程数
-num_threads = 1
 torch.set_num_threads(num_threads)
 
 print("---- 创建GOPS Gym环境 ----")
@@ -232,11 +250,24 @@ control_policy_par["dtype"] = dtype
 control_policy_par["device"] = device
 
 print("\n---- 设置代价函数参数 ----")
-f_cost_function = Cost_function.Expected_saturated_distance
-cost_function_par = {}
-cost_function_par["target_state"] = torch.zeros(state_dim, dtype=dtype, device=device)
-cost_function_par["lengthscales"] = torch.tensor([1.0, 0.1, 1.0, 1.0], dtype=dtype, device=device)
-cost_function_par["active_dims"] = np.arange(state_dim)
+if use_suspension_cost:
+    f_cost_function = Cost_function.Expected_suspension_evaluation_cost
+    cost_function_par = {
+        "w_acc": w_acc,
+        "w_tire": w_tire,
+        "w_barrier": w_barrier,
+        "l_acc": l_acc,
+        "l_tire": l_tire,
+        "d_barrier": d_barrier,
+        "beta": beta_barrier,
+        "obs_scaling": env_config["obs_scaling"]
+    }
+else:
+    f_cost_function = Cost_function.Expected_saturated_distance
+    cost_function_par = {}
+    cost_function_par["target_state"] = torch.zeros(state_dim, dtype=dtype, device=device)
+    cost_function_par["lengthscales"] = torch.tensor([cost_l0, cost_l1, cost_l2, cost_l3], dtype=dtype, device=device)
+    cost_function_par["active_dims"] = np.arange(state_dim)
 
 print("\n---- 设置初始状态 ----")
 initial_state = np.array([0.0, 0.0, 0.0, 0.0])  # Physical reset state [xs, vs, xu, vu]
@@ -286,6 +317,18 @@ experiment_info = {
         "lr_list": policy_optimization_dict["lr_list"],
         "opt_steps_list": policy_optimization_dict["opt_steps_list"],
         "p_dropout_list": policy_optimization_dict["p_dropout_list"],
+        "cost_l0": cost_l0,
+        "cost_l1": cost_l1,
+        "cost_l2": cost_l2,
+        "cost_l3": cost_l3,
+        "use_suspension_cost": use_suspension_cost,
+        "w_acc": w_acc,
+        "w_tire": w_tire,
+        "w_barrier": w_barrier,
+        "l_acc": l_acc,
+        "l_tire": l_tire,
+        "d_barrier": d_barrier,
+        "beta_barrier": beta_barrier,
     },
 }
 print("结果目录:", log_path)

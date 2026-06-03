@@ -5,9 +5,9 @@
 Small Tkinter launcher for quarter-car MC-PILCO training and plotting.
 """
 
+import json
 import os
 import queue
-import json
 import re
 import subprocess
 import sys
@@ -15,6 +15,15 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+try:
+    import torch
+
+    has_cuda = torch.cuda.is_available()
+except ImportError:
+    has_cuda = False
+
+default_threads = str(min(4, os.cpu_count() or 1))
 
 
 WORKSPACE = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +38,8 @@ TRAIN_CATEGORIES = {
         ("result_root", "-result_root", "./results_tmp/quarter_car_gym"),
         ("run_name", "-run_name", "baseline"),
         ("num_trials", "-num_trials", "2"),
+        ("device", "-device", "cuda" if has_cuda else "cpu"),
+        ("num_threads", "-num_threads", default_threads),
     ],
     "强化学习与训练控制 (RL & Policy)": [
         ("T_sampling", "-T_sampling", "0.01"),
@@ -65,6 +76,20 @@ TRAIN_CATEGORIES = {
         ("punish_Q_flec_t", "-punish_Q_flec_t", "1.0"),
         ("punish_Q_acc_s_h", "-punish_Q_acc_s_h", "2.5"),
         ("punish_Q_b_defelc", "-punish_Q_b_defelc", "-80.0"),
+        ("cost_l0 (舒适性-车身加速度)", "-cost_l0", "1.0"),
+        ("cost_l1 (车身速度)", "-cost_l1", "0.1"),
+        ("cost_l2 (动行程-悬架相对变形)", "-cost_l2", "1.0"),
+        ("cost_l3 (悬架相对变形速度)", "-cost_l3", "1.0"),
+    ],
+    "物理对齐综合代价 (Physics-Aligned Cost)": [
+        ("use_suspension_cost (启用综合评价代价)", "-use_suspension_cost", "False"),
+        ("w_acc (舒适性权重)", "-w_acc", "0.4"),
+        ("w_tire (接地性权重)", "-w_tire", "0.4"),
+        ("w_barrier (行程限位安全权重)", "-w_barrier", "0.2"),
+        ("l_acc (舒适性加速度尺度 m/s^2)", "-l_acc", "1.5"),
+        ("l_tire (动变形尺度 m)", "-l_tire", "0.006"),
+        ("d_barrier (安全屏障起始点 m)", "-d_barrier", "0.035"),
+        ("beta_barrier (安全屏障陡度)", "-beta_barrier", "150.0"),
     ],
 }
 
@@ -102,7 +127,7 @@ class Launcher(tk.Tk):
         self.simplify_log_var = tk.BooleanVar(value=True)
         self.current_trial = 0
         self.start_time = None
-        
+
         self._build_ui()
         self.refresh_config_list()
         self.after(100, self._poll_output_queue)
@@ -146,7 +171,13 @@ class Launcher(tk.Tk):
         ttk.Checkbutton(controls, text="训练后自动画图", variable=self.plot_after_train_var).pack(side=tk.LEFT, padx=12)
         ttk.Checkbutton(controls, text="允许覆盖已有目录", variable=self.overwrite_var).pack(side=tk.LEFT)
         ttk.Label(controls, text=" 训练脚本:").pack(side=tk.LEFT, padx=(12, 4))
-        self.script_combo = ttk.Combobox(controls, textvariable=self.train_mode_var, values=["Baseline", "State Reconstruct", "Physics Residual"], width=18, state="readonly")
+        self.script_combo = ttk.Combobox(
+            controls,
+            textvariable=self.train_mode_var,
+            values=["Baseline", "State Reconstruct", "Physics Residual"],
+            width=18,
+            state="readonly",
+        )
         self.script_combo.pack(side=tk.LEFT)
         ttk.Button(controls, text="同步到画图参数", command=self.copy_train_to_plot).pack(side=tk.LEFT, padx=12)
         ttk.Button(controls, text="打开结果目录", command=self.open_train_folder).pack(side=tk.LEFT)
@@ -156,15 +187,15 @@ class Launcher(tk.Tk):
         canvas = tk.Canvas(canvas_frame, highlightthickness=0)
         scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
         fields_frame = ttk.Frame(canvas)
-        
+
         canvas_window = canvas.create_window((0, 0), window=fields_frame, anchor="nw")
-        
+
         def _on_canvas_configure(event):
             canvas.itemconfig(canvas_window, width=event.width)
-            
+
         canvas.bind("<Configure>", _on_canvas_configure)
         fields_frame.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
-        
+
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -172,20 +203,28 @@ class Launcher(tk.Tk):
         for category, fields in TRAIN_CATEGORIES.items():
             lf = ttk.LabelFrame(fields_frame, text=" " + category + " ", padding=10)
             lf.pack(fill=tk.X, expand=True, pady=6, padx=5)
-            
+
             lf.columnconfigure(1, weight=1)
             lf.columnconfigure(3, weight=1)
-            
+
             for idx, (label, _arg, default) in enumerate(fields):
                 row = idx // 2
                 col = (idx % 2) * 2
                 var = tk.StringVar(value=default)
                 self.train_vars[label] = var
-                
-                ttk.Label(lf, text=label, width=20).grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=4)
-                
+
+                ttk.Label(lf, text=label).grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=4)
+
                 if label == "Road_Type":
-                    combo = ttk.Combobox(lf, textvariable=var, values=["Random", "Sine", "Chirp", "Bump"], width=27, state="readonly")
+                    combo = ttk.Combobox(
+                        lf, textvariable=var, values=["Random", "Sine", "Chirp", "Bump"], width=27, state="readonly"
+                    )
+                    combo.grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
+                elif label == "device":
+                    combo = ttk.Combobox(lf, textvariable=var, values=["cpu", "cuda"], width=27, state="readonly")
+                    combo.grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
+                elif "use_suspension_cost" in label:
+                    combo = ttk.Combobox(lf, textvariable=var, values=["False", "True"], width=27, state="readonly")
                     combo.grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
                 else:
                     ttk.Entry(lf, textvariable=var, width=30).grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
@@ -195,14 +234,15 @@ class Launcher(tk.Tk):
         controls.pack(fill=tk.X, pady=(0, 8))
         ttk.Button(controls, text="启动画图", command=self.run_plotting).pack(side=tk.LEFT)
         ttk.Button(controls, text="选择 log_dir", command=self.choose_plot_log_dir).pack(side=tk.LEFT, padx=12)
-        ttk.Button(controls, text="打开画图目录", command=self.open_plot_folder).pack(side=tk.LEFT)
+        ttk.Button(controls, text="清除 log_dir", command=lambda: self.plot_vars["log_dir"].set("")).pack(side=tk.LEFT)
+        ttk.Button(controls, text="打开画图目录", command=self.open_plot_folder).pack(side=tk.LEFT, padx=12)
 
         grid = ttk.Frame(parent)
         grid.pack(fill=tk.X)
         for index, (label, _arg, default) in enumerate(PLOT_FIELDS):
             var = tk.StringVar(value=default)
             self.plot_vars[label] = var
-            ttk.Label(grid, text=label, width=20).grid(row=index, column=0, sticky=tk.W, padx=(0, 6), pady=4)
+            ttk.Label(grid, text=label).grid(row=index, column=0, sticky=tk.W, padx=(0, 6), pady=4)
             ttk.Entry(grid, textvariable=var, width=70).grid(row=index, column=1, sticky=tk.EW, pady=4)
         grid.columnconfigure(1, weight=1)
 
@@ -214,7 +254,7 @@ class Launcher(tk.Tk):
         ttk.Checkbutton(bar, text="简化日志输出", variable=self.simplify_log_var).pack(side=tk.LEFT, padx=12)
 
         # Add progress bar and status label on the right
-        self.progress_bar = ttk.Progressbar(bar, orient=tk.HORIZONTAL, length=200, mode='determinate')
+        self.progress_bar = ttk.Progressbar(bar, orient=tk.HORIZONTAL, length=200, mode="determinate")
         self.progress_bar.pack(side=tk.RIGHT, padx=10)
         self.time_label = ttk.Label(bar, text="已用: -- | 剩余: --")
         self.time_label.pack(side=tk.RIGHT, padx=10)
@@ -235,7 +275,11 @@ class Launcher(tk.Tk):
         for label, flag, _default in field_defs:
             value = var_map[label].get().strip()
             if value:
-                args.extend([flag, value])
+                if flag == "-use_suspension_cost":
+                    if value.lower() in ["true", "1", "yes"]:
+                        args.append(flag)
+                else:
+                    args.extend([flag, value])
         return args
 
     def _run_command(self, command, on_success=None):
@@ -289,7 +333,7 @@ class Launcher(tk.Tk):
 
     def parse_progress(self, line):
         line_strip = line.strip()
-        
+
         # Check exited
         if "exited with code" in line_strip:
             if "code 0" in line_strip:
@@ -336,9 +380,11 @@ class Launcher(tk.Tk):
             except ValueError:
                 total_trials = 2
                 trial_num = 0
-            
-            self.status_label.config(text="Trial {} / {} | Step {} / {}".format(trial_num + 1, total_trials, step_num, total_steps))
-            
+
+            self.status_label.config(
+                text="Trial {} / {} | Step {} / {}".format(trial_num + 1, total_trials, step_num, total_steps)
+            )
+
             base_pct = (trial_num / total_trials) * 100
             step_pct = (step_num / total_steps) * (100 / total_trials)
             self.progress_bar.config(value=base_pct + step_pct)
@@ -367,7 +413,7 @@ class Launcher(tk.Tk):
         # Check for errors, tracebacks, warnings
         if any(keyword in line for keyword in ["Error", "Exception", "Traceback", "WARNING", "Warning", "failed"]):
             return line
-        if line.startswith(" ") and ("File \"" in line or "line " in line):
+        if line.startswith(" ") and ('File "' in line or "line " in line):
             return line
 
         # Check for headers or stage transitions
@@ -389,7 +435,7 @@ class Launcher(tk.Tk):
             "MSE gp",
             "exited with code",
             "Save log file",
-            "结果已保存"
+            "结果已保存",
         ]
         if any(milestone in line for milestone in milestones):
             return line
@@ -518,15 +564,15 @@ class Launcher(tk.Tk):
         if self.start_time is None:
             self.time_label.config(text="已用: -- | 剩余: --")
             return
-        
+
         elapsed = time.time() - self.start_time
         pct = float(self.progress_bar["value"]) / 100.0
-        
+
         if pct > 0.01:
             remaining = elapsed / pct - elapsed
         else:
             remaining = None
-            
+
         elapsed_str = self.format_duration(elapsed)
         remaining_str = self.format_duration(remaining)
         self.time_label.config(text="已用: {} | 剩余: {}".format(elapsed_str, remaining_str))
@@ -540,6 +586,10 @@ class Launcher(tk.Tk):
             self.plot_vars["run_name"].set(self.train_vars["run_name"].get() + "_reconstruct")
         elif mode == "Physics Residual":
             self.plot_vars["run_name"].set(self.train_vars["run_name"].get() + "_residual")
+
+        # Clear manual log_dir to allow plotting to fall back to auto-generated path from synced parameters
+        if "log_dir" in self.plot_vars:
+            self.plot_vars["log_dir"].set("")
 
     def choose_plot_log_dir(self):
         folder = filedialog.askdirectory(initialdir=WORKSPACE)
