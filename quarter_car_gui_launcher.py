@@ -5,9 +5,9 @@
 Small Tkinter launcher for quarter-car MC-PILCO training and plotting.
 """
 
+import json
 import os
 import queue
-import json
 import re
 import subprocess
 import sys
@@ -16,11 +16,45 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    import torch
+
+    has_cuda = torch.cuda.is_available()
+except ImportError:
+    has_cuda = False
+
+default_threads = str(min(4, os.cpu_count() or 1))
+
 
 WORKSPACE = os.path.dirname(os.path.abspath(__file__))
 TRAIN_SCRIPT = "test_mcpilco_quarter_car_gym.py"
 PLOT_SCRIPT = "log_plot_quarter_car.py"
 CONFIG_DIR = os.path.join(WORKSPACE, "launcher_configs")
+
+
+TRAIN_MODES = {
+    "Road-aware GP": {
+        "script": TRAIN_SCRIPT,
+        "extra_args": [],
+        "run_name_suffix": "_roadgp",
+    },
+    "Baseline": {
+        "script": TRAIN_SCRIPT,
+        "extra_args": ["-disable_road_gp_input"],
+        "run_name_suffix": "",
+    },
+    "State Reconstruct": {
+        "script": "test_mcpilco_quarter_car_gym_reconstruct.py",
+        "extra_args": [],
+        "run_name_suffix": "_reconstruct",
+    },
+    "Physics Residual": {
+        "script": "test_mcpilco_quarter_car_gym_residual.py",
+        "extra_args": [],
+        "run_name_suffix": "_residual",
+    },
+}
+DEFAULT_TRAIN_MODE = "Road-aware GP"
 
 
 TRAIN_CATEGORIES = {
@@ -29,6 +63,8 @@ TRAIN_CATEGORIES = {
         ("result_root", "-result_root", "./results_tmp/quarter_car_gym"),
         ("run_name", "-run_name", "baseline"),
         ("num_trials", "-num_trials", "2"),
+        ("device", "-device", "cuda" if has_cuda else "cpu"),
+        ("num_threads", "-num_threads", default_threads),
     ],
     "强化学习与训练控制 (RL & Policy)": [
         ("T_sampling", "-T_sampling", "0.01"),
@@ -41,6 +77,15 @@ TRAIN_CATEGORIES = {
         ("lr", "-lr", "0.01"),
         ("p_dropout", "-p_dropout", "0.05"),
         ("model_epochs", "-model_epochs", "2"),
+    ],
+    "Gym 环境与安全限制 (Gym & Safety)": [
+        ("Max_step", "-Max_step", "2000"),
+        ("act_repeat", "-act_repeat", "10"),
+        ("act_scaling", "-act_scaling", "0.001"),
+        ("rew_scaling", "-rew_scaling", "0.2"),
+        ("act_max", "-act_max", "1000.0"),
+        ("as_max", "-as_max", "1.0"),
+        ("deflec_max", "-deflec_max", "0.04"),
     ],
     "悬架物理模型参数 (Suspension Dynamics)": [
         ("Ks", "-Ks", "20000.0"),
@@ -59,12 +104,27 @@ TRAIN_CATEGORIES = {
     ],
     "代价函数惩罚权重 (Cost Weights)": [
         ("punish_Q_acc_s", "-punish_Q_acc_s", "10.0"),
+        ("punish_b_deflec", "-punish_b_deflec", "0.025"),
         ("punish_Q_flec", "-punish_Q_flec", "50.0"),
         ("punish_Q_F", "-punish_Q_F", "1.0"),
         ("punish_Q_delta_F", "-punish_Q_delta_F", "5.0"),
         ("punish_Q_flec_t", "-punish_Q_flec_t", "1.0"),
         ("punish_Q_acc_s_h", "-punish_Q_acc_s_h", "2.5"),
         ("punish_Q_b_defelc", "-punish_Q_b_defelc", "-80.0"),
+        ("cost_l0 (舒适性-车身加速度)", "-cost_l0", "1.0"),
+        ("cost_l1 (车身速度)", "-cost_l1", "0.1"),
+        ("cost_l2 (动行程-悬架相对变形)", "-cost_l2", "1.0"),
+        ("cost_l3 (悬架相对变形速度)", "-cost_l3", "1.0"),
+    ],
+    "物理对齐综合代价 (Physics-Aligned Cost)": [
+        ("use_suspension_cost (启用综合评价代价)", "-use_suspension_cost", "False"),
+        ("w_acc (舒适性权重)", "-w_acc", "0.4"),
+        ("w_tire (接地性权重)", "-w_tire", "0.4"),
+        ("w_barrier (行程限位安全权重)", "-w_barrier", "0.2"),
+        ("l_acc (舒适性加速度尺度 m/s^2)", "-l_acc", "1.5"),
+        ("l_tire (动变形尺度 m)", "-l_tire", "0.006"),
+        ("d_barrier (安全屏障起始点 m)", "-d_barrier", "0.035"),
+        ("beta_barrier (安全屏障陡度)", "-beta_barrier", "150.0"),
     ],
 }
 
@@ -91,6 +151,7 @@ class Launcher(tk.Tk):
         self.output_queue = queue.Queue()
         self.process = None
         self.after_train_plot = False
+        self.is_training = False
 
         self.conda_env = tk.StringVar(value="mc-pilco")
         self.config_name = tk.StringVar(value="baseline")
@@ -98,11 +159,13 @@ class Launcher(tk.Tk):
         self.plot_vars = {}
         self.overwrite_var = tk.BooleanVar(value=False)
         self.plot_after_train_var = tk.BooleanVar(value=True)
-        self.train_mode_var = tk.StringVar(value="Baseline")
+        self.notify_enabled_var = tk.BooleanVar(value=True)
+        self.notify_key_var = tk.StringVar(value="201cbfcf")
+        self.train_mode_var = tk.StringVar(value=DEFAULT_TRAIN_MODE)
         self.simplify_log_var = tk.BooleanVar(value=True)
         self.current_trial = 0
         self.start_time = None
-        
+
         self._build_ui()
         self.refresh_config_list()
         self.after(100, self._poll_output_queue)
@@ -146,7 +209,13 @@ class Launcher(tk.Tk):
         ttk.Checkbutton(controls, text="训练后自动画图", variable=self.plot_after_train_var).pack(side=tk.LEFT, padx=12)
         ttk.Checkbutton(controls, text="允许覆盖已有目录", variable=self.overwrite_var).pack(side=tk.LEFT)
         ttk.Label(controls, text=" 训练脚本:").pack(side=tk.LEFT, padx=(12, 4))
-        self.script_combo = ttk.Combobox(controls, textvariable=self.train_mode_var, values=["Baseline", "State Reconstruct", "Physics Residual"], width=18, state="readonly")
+        self.script_combo = ttk.Combobox(
+            controls,
+            textvariable=self.train_mode_var,
+            values=list(TRAIN_MODES.keys()),
+            width=18,
+            state="readonly",
+        )
         self.script_combo.pack(side=tk.LEFT)
         ttk.Button(controls, text="同步到画图参数", command=self.copy_train_to_plot).pack(side=tk.LEFT, padx=12)
         ttk.Button(controls, text="打开结果目录", command=self.open_train_folder).pack(side=tk.LEFT)
@@ -156,15 +225,15 @@ class Launcher(tk.Tk):
         canvas = tk.Canvas(canvas_frame, highlightthickness=0)
         scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
         fields_frame = ttk.Frame(canvas)
-        
+
         canvas_window = canvas.create_window((0, 0), window=fields_frame, anchor="nw")
-        
+
         def _on_canvas_configure(event):
             canvas.itemconfig(canvas_window, width=event.width)
-            
+
         canvas.bind("<Configure>", _on_canvas_configure)
         fields_frame.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
-        
+
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -172,37 +241,60 @@ class Launcher(tk.Tk):
         for category, fields in TRAIN_CATEGORIES.items():
             lf = ttk.LabelFrame(fields_frame, text=" " + category + " ", padding=10)
             lf.pack(fill=tk.X, expand=True, pady=6, padx=5)
-            
+
             lf.columnconfigure(1, weight=1)
             lf.columnconfigure(3, weight=1)
-            
+
             for idx, (label, _arg, default) in enumerate(fields):
                 row = idx // 2
                 col = (idx % 2) * 2
                 var = tk.StringVar(value=default)
                 self.train_vars[label] = var
-                
-                ttk.Label(lf, text=label, width=20).grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=4)
-                
+
+                ttk.Label(lf, text=label).grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=4)
+
                 if label == "Road_Type":
-                    combo = ttk.Combobox(lf, textvariable=var, values=["Random", "Sine", "Chirp", "Bump"], width=27, state="readonly")
+                    combo = ttk.Combobox(
+                        lf, textvariable=var, values=["Random", "Sine", "Chirp", "Bump"], width=27, state="readonly"
+                    )
+                    combo.grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
+                elif label == "device":
+                    combo = ttk.Combobox(lf, textvariable=var, values=["cpu", "cuda"], width=27, state="readonly")
+                    combo.grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
+                elif "use_suspension_cost" in label:
+                    combo = ttk.Combobox(lf, textvariable=var, values=["False", "True"], width=27, state="readonly")
                     combo.grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
                 else:
                     ttk.Entry(lf, textvariable=var, width=30).grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
+
+        # 手机通知推送设置 (Mobile Notification Settings)
+        notify_lf = ttk.LabelFrame(fields_frame, text=" 手机通知推送设置 (Mobile Notification) ", padding=10)
+        notify_lf.pack(fill=tk.X, expand=True, pady=6, padx=5)
+        notify_lf.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(notify_lf, text="训练结束时推送手机通知", variable=self.notify_enabled_var).grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 15), pady=4
+        )
+        ttk.Label(notify_lf, text="推送 Key (或完整URL):").grid(row=0, column=1, sticky=tk.E, padx=(10, 4), pady=4)
+        ttk.Entry(notify_lf, textvariable=self.notify_key_var, width=30).grid(row=0, column=2, sticky=tk.W, pady=4)
+        ttk.Button(notify_lf, text="测试推送", command=self.test_notification).grid(
+            row=0, column=3, sticky=tk.W, padx=(15, 0), pady=4
+        )
 
     def _build_plot_tab(self, parent):
         controls = ttk.Frame(parent)
         controls.pack(fill=tk.X, pady=(0, 8))
         ttk.Button(controls, text="启动画图", command=self.run_plotting).pack(side=tk.LEFT)
         ttk.Button(controls, text="选择 log_dir", command=self.choose_plot_log_dir).pack(side=tk.LEFT, padx=12)
-        ttk.Button(controls, text="打开画图目录", command=self.open_plot_folder).pack(side=tk.LEFT)
+        ttk.Button(controls, text="清除 log_dir", command=lambda: self.plot_vars["log_dir"].set("")).pack(side=tk.LEFT)
+        ttk.Button(controls, text="打开画图目录", command=self.open_plot_folder).pack(side=tk.LEFT, padx=12)
 
         grid = ttk.Frame(parent)
         grid.pack(fill=tk.X)
         for index, (label, _arg, default) in enumerate(PLOT_FIELDS):
             var = tk.StringVar(value=default)
             self.plot_vars[label] = var
-            ttk.Label(grid, text=label, width=20).grid(row=index, column=0, sticky=tk.W, padx=(0, 6), pady=4)
+            ttk.Label(grid, text=label).grid(row=index, column=0, sticky=tk.W, padx=(0, 6), pady=4)
             ttk.Entry(grid, textvariable=var, width=70).grid(row=index, column=1, sticky=tk.EW, pady=4)
         grid.columnconfigure(1, weight=1)
 
@@ -214,7 +306,7 @@ class Launcher(tk.Tk):
         ttk.Checkbutton(bar, text="简化日志输出", variable=self.simplify_log_var).pack(side=tk.LEFT, padx=12)
 
         # Add progress bar and status label on the right
-        self.progress_bar = ttk.Progressbar(bar, orient=tk.HORIZONTAL, length=200, mode='determinate')
+        self.progress_bar = ttk.Progressbar(bar, orient=tk.HORIZONTAL, length=200, mode="determinate")
         self.progress_bar.pack(side=tk.RIGHT, padx=10)
         self.time_label = ttk.Label(bar, text="已用: -- | 剩余: --")
         self.time_label.pack(side=tk.RIGHT, padx=10)
@@ -230,18 +322,23 @@ class Launcher(tk.Tk):
             return ["conda", "run", "--no-capture-output", "-n", env, "python", "-u", script_name]
         return [sys.executable, "-u", script_name]
 
-    def _fields_to_args(self, field_defs, var_map):
+    def _fields_to_args(self, field_defs, var_map, overrides=None):
+        overrides = overrides or {}
         args = []
         for label, flag, _default in field_defs:
-            value = var_map[label].get().strip()
+            value = str(overrides[label] if label in overrides else var_map[label].get()).strip()
             if value:
-                args.extend([flag, value])
+                if flag == "-use_suspension_cost":
+                    if value.lower() in ["true", "1", "yes"]:
+                        args.append(flag)
+                else:
+                    args.extend([flag, value])
         return args
 
     def _run_command(self, command, on_success=None):
         if self.process is not None and self.process.poll() is None:
             messagebox.showwarning("正在运行", "已有任务在运行，请先停止或等待完成。")
-            return
+            return False
 
         self._append_output("\n$ " + " ".join(command) + "\n")
         self.start_time = time.time()
@@ -258,6 +355,7 @@ class Launcher(tk.Tk):
         )
         thread = threading.Thread(target=self._reader_thread, args=(self.process, on_success), daemon=True)
         thread.start()
+        return True
 
     def _reader_thread(self, process, on_success):
         assert process.stdout is not None
@@ -289,15 +387,32 @@ class Launcher(tk.Tk):
 
     def parse_progress(self, line):
         line_strip = line.strip()
-        
+
         # Check exited
         if "exited with code" in line_strip:
+            elapsed = time.time() - self.start_time if self.start_time is not None else None
+            elapsed_str = self.format_duration(elapsed) if elapsed is not None else "未知"
+
+            run_name = self.effective_train_run_name()
+            mode = self.train_mode_var.get()
+
             if "code 0" in line_strip:
                 self.status_label.config(text="完成")
                 self.progress_bar.config(value=100)
+                if getattr(self, "is_training", False):
+                    self.send_phone_notification(
+                        title="MC-PILCO 训练已完成",
+                        message=f"模式: {mode}\n运行名称: {run_name}\n运行状态: 成功\n总耗时: {elapsed_str}",
+                    )
             else:
                 self.status_label.config(text="异常退出")
+                if getattr(self, "is_training", False):
+                    self.send_phone_notification(
+                        title="MC-PILCO 训练失败",
+                        message=f"模式: {mode}\n运行名称: {run_name}\n运行状态: 失败 ({line_strip.strip()})\n已运行: {elapsed_str}",
+                    )
             self.start_time = None
+            self.is_training = False
             return
 
         # Match Exploration
@@ -336,9 +451,11 @@ class Launcher(tk.Tk):
             except ValueError:
                 total_trials = 2
                 trial_num = 0
-            
-            self.status_label.config(text="Trial {} / {} | Step {} / {}".format(trial_num + 1, total_trials, step_num, total_steps))
-            
+
+            self.status_label.config(
+                text="Trial {} / {} | Step {} / {}".format(trial_num + 1, total_trials, step_num, total_steps)
+            )
+
             base_pct = (trial_num / total_trials) * 100
             step_pct = (step_num / total_steps) * (100 / total_trials)
             self.progress_bar.config(value=base_pct + step_pct)
@@ -367,7 +484,7 @@ class Launcher(tk.Tk):
         # Check for errors, tracebacks, warnings
         if any(keyword in line for keyword in ["Error", "Exception", "Traceback", "WARNING", "Warning", "failed"]):
             return line
-        if line.startswith(" ") and ("File \"" in line or "line " in line):
+        if line.startswith(" ") and ('File "' in line or "line " in line):
             return line
 
         # Check for headers or stage transitions
@@ -389,7 +506,7 @@ class Launcher(tk.Tk):
             "MSE gp",
             "exited with code",
             "Save log file",
-            "结果已保存"
+            "结果已保存",
         ]
         if any(milestone in line for milestone in milestones):
             return line
@@ -400,8 +517,14 @@ class Launcher(tk.Tk):
         self.output.insert(tk.END, text)
         self.output.see(tk.END)
 
+    def _var_value(self, var_map, key, default=""):
+        var = var_map.get(key)
+        if var is None:
+            return default
+        return var.get()
+
     def config_file_name(self, name):
-        name = name.strip() or self.train_vars.get("run_name", tk.StringVar(value="config")).get()
+        name = name.strip() or self._var_value(self.train_vars, "run_name", "config")
         name = re.sub(r"[^0-9A-Za-z._-]+", "_", name).strip("._-")
         return (name or "config") + ".json"
 
@@ -424,6 +547,8 @@ class Launcher(tk.Tk):
             "conda_env": self.conda_env.get(),
             "overwrite_existing": self.overwrite_var.get(),
             "plot_after_train": self.plot_after_train_var.get(),
+            "notify_enabled": self.notify_enabled_var.get(),
+            "notify_key": self.notify_key_var.get(),
             "train_mode": self.train_mode_var.get(),
             "train": {key: var.get() for key, var in self.train_vars.items()},
             "plot": {key: var.get() for key, var in self.plot_vars.items()},
@@ -436,6 +561,10 @@ class Launcher(tk.Tk):
             self.overwrite_var.set(bool(data["overwrite_existing"]))
         if "plot_after_train" in data:
             self.plot_after_train_var.set(bool(data["plot_after_train"]))
+        if "notify_enabled" in data:
+            self.notify_enabled_var.set(bool(data["notify_enabled"]))
+        if "notify_key" in data:
+            self.notify_key_var.set(str(data["notify_key"]))
         if "train_mode" in data:
             self.train_mode_var.set(data["train_mode"])
         for key, value in data.get("train", {}).items():
@@ -444,6 +573,18 @@ class Launcher(tk.Tk):
         for key, value in data.get("plot", {}).items():
             if key in self.plot_vars:
                 self.plot_vars[key].set(str(value))
+
+    def current_train_mode_config(self):
+        return TRAIN_MODES.get(self.train_mode_var.get(), TRAIN_MODES[DEFAULT_TRAIN_MODE])
+
+    def _append_suffix_once(self, value, suffix):
+        if not value or not suffix or value.endswith(suffix):
+            return value
+        return value + suffix
+
+    def effective_train_run_name(self):
+        run_name = self._var_value(self.train_vars, "run_name").strip()
+        return self._append_suffix_once(run_name, self.current_train_mode_config()["run_name_suffix"])
 
     def save_config(self):
         suggested_name = self.config_name.get().strip() or self.train_vars["run_name"].get().strip()
@@ -473,18 +614,15 @@ class Launcher(tk.Tk):
 
     def run_training(self):
         self.copy_train_to_plot()
-        mode = self.train_mode_var.get()
-        if mode == "State Reconstruct":
-            script = "test_mcpilco_quarter_car_gym_reconstruct.py"
-        elif mode == "Physics Residual":
-            script = "test_mcpilco_quarter_car_gym_residual.py"
-        else:
-            script = "test_mcpilco_quarter_car_gym.py"
-        command = self._python_command(script)
-        command.extend(self._fields_to_args(TRAIN_FIELDS, self.train_vars))
+        mode_config = self.current_train_mode_config()
+        command = self._python_command(mode_config["script"])
+        run_name = self.effective_train_run_name()
+        overrides = {"run_name": run_name} if run_name else {}
+        command.extend(self._fields_to_args(TRAIN_FIELDS, self.train_vars, overrides=overrides))
+        command.extend(mode_config["extra_args"])
         if self.overwrite_var.get():
             command.append("-overwrite_existing")
-        self._run_command(command, on_success=self.on_train_success)
+        self.is_training = self._run_command(command, on_success=self.on_train_success)
 
     def on_train_success(self):
         messagebox.showinfo("训练完成", "四分之一悬架强化学习训练已成功完成！")
@@ -496,11 +634,50 @@ class Launcher(tk.Tk):
         command.extend(self._fields_to_args(PLOT_FIELDS, self.plot_vars))
         self._run_command(command)
 
+    def send_phone_notification(self, title, message):
+        if not self.notify_enabled_var.get():
+            return
+
+        key_or_url = self.notify_key_var.get().strip()
+        if not key_or_url:
+            return
+
+        # Determine the full base URL
+        if key_or_url.startswith("http://") or key_or_url.startswith("https://"):
+            base_url = key_or_url.rstrip("/")
+        else:
+            base_url = f"http://api.chuckfang.com/{key_or_url}"
+
+        def target():
+            try:
+                import urllib.parse
+                import urllib.request
+
+                # Encode title and message for the URL path
+                encoded_title = urllib.parse.quote(title)
+                encoded_message = urllib.parse.quote(message)
+
+                url = f"{base_url}/{encoded_title}/{encoded_message}"
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    response.read()
+                self.output_queue.put(("text", f"\n[手机推送成功] 已成功向 {base_url} 发送通知\n"))
+            except Exception as e:
+                self.output_queue.put(("text", f"\n[手机推送失败] 无法发送通知: {e}\n"))
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def test_notification(self):
+        title = "MC-PILCO 启动器测试"
+        message = f"这是一条测试推送消息。当前时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+        self.send_phone_notification(title, message)
+
     def stop_process(self):
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             self._append_output("\n[terminate requested]\n")
             self.start_time = None
+            self.is_training = False
 
     def format_duration(self, seconds):
         if seconds is None or seconds < 0:
@@ -518,15 +695,15 @@ class Launcher(tk.Tk):
         if self.start_time is None:
             self.time_label.config(text="已用: -- | 剩余: --")
             return
-        
+
         elapsed = time.time() - self.start_time
         pct = float(self.progress_bar["value"]) / 100.0
-        
+
         if pct > 0.01:
             remaining = elapsed / pct - elapsed
         else:
             remaining = None
-            
+
         elapsed_str = self.format_duration(elapsed)
         remaining_str = self.format_duration(remaining)
         self.time_label.config(text="已用: {} | 剩余: {}".format(elapsed_str, remaining_str))
@@ -535,11 +712,12 @@ class Launcher(tk.Tk):
         for key in ("seed", "result_root", "run_name"):
             if key in self.train_vars and key in self.plot_vars:
                 self.plot_vars[key].set(self.train_vars[key].get())
-        mode = self.train_mode_var.get()
-        if mode == "State Reconstruct":
-            self.plot_vars["run_name"].set(self.train_vars["run_name"].get() + "_reconstruct")
-        elif mode == "Physics Residual":
-            self.plot_vars["run_name"].set(self.train_vars["run_name"].get() + "_residual")
+        if "run_name" in self.plot_vars:
+            self.plot_vars["run_name"].set(self.effective_train_run_name())
+
+        # Clear manual log_dir to allow plotting to fall back to auto-generated path from synced parameters
+        if "log_dir" in self.plot_vars:
+            self.plot_vars["log_dir"].set("")
 
     def choose_plot_log_dir(self):
         folder = filedialog.askdirectory(initialdir=WORKSPACE)
@@ -549,12 +727,7 @@ class Launcher(tk.Tk):
     def train_folder(self):
         result_root = self.train_vars["result_root"].get().strip()
         seed = self.train_vars["seed"].get().strip()
-        run_name = self.train_vars["run_name"].get().strip()
-        mode = self.train_mode_var.get()
-        if mode == "State Reconstruct":
-            run_name += "_reconstruct"
-        elif mode == "Physics Residual":
-            run_name += "_residual"
+        run_name = self.effective_train_run_name()
         return os.path.join(WORKSPACE, result_root, "seed_" + seed, run_name)
 
     def plot_folder(self):

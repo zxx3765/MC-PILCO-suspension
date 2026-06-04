@@ -80,12 +80,52 @@ class MC_PILCO(torch.nn.Module):
         self.state_samples_history = []
         self.input_samples_history = []
         self.noiseless_states_history = []
+        self.exogenous_samples_history = []
         # initialize num_data_collection
         self.num_data_collection = 0
         # create log file dictionary
         self.log_path = log_path
         if self.log_path is not None:
             self.log_dict = {}
+
+    def _uses_exogenous_inputs(self):
+        return getattr(self.model_learning, "use_exogenous_inputs", False)
+
+    def _get_exogenous_history_tensor(self, data_collection_index):
+        if not self._uses_exogenous_inputs():
+            return None
+        if data_collection_index >= len(self.exogenous_samples_history):
+            return None
+        exogenous_samples = self.exogenous_samples_history[data_collection_index]
+        if exogenous_samples is None:
+            return None
+        return torch.tensor(exogenous_samples, dtype=self.dtype, device=self.device)
+
+    def sample_exogenous_sequence(self, horizon, num_particles):
+        if not self._uses_exogenous_inputs():
+            return None
+
+        histories = [
+            np.asarray(history)
+            for history in self.exogenous_samples_history
+            if history is not None and np.asarray(history).size > 0
+        ]
+        if len(histories) == 0:
+            raise RuntimeError("Road-aware GP policy rollout needs exogenous road samples, but none were collected.")
+
+        horizon = int(horizon)
+        exogenous_dim = histories[0].shape[1]
+        sequence = torch.zeros([horizon, num_particles, exogenous_dim], dtype=self.dtype, device=self.device)
+        for particle_index in range(num_particles):
+            history = histories[np.random.randint(len(histories))]
+            if history.shape[0] >= horizon:
+                start_index = np.random.randint(history.shape[0] - horizon + 1)
+                sample = history[start_index : start_index + horizon, :]
+            else:
+                sample = np.repeat(history[-1:, :], horizon, axis=0)
+                sample[: history.shape[0], :] = history
+            sequence[:, particle_index, :] = torch.tensor(sample, dtype=self.dtype, device=self.device)
+        return sequence
 
     def reinforce(
         self,
@@ -181,6 +221,7 @@ class MC_PILCO(torch.nn.Module):
                     self.log_dict["state_samples_history"] = self.state_samples_history
                     self.log_dict["input_samples_history"] = self.input_samples_history
                     self.log_dict["noiseless_states_history"] = self.noiseless_states_history
+                    self.log_dict["exogenous_samples_history"] = self.exogenous_samples_history
                     self.log_dict["road_profile"] = road_profile
                     os.makedirs(self.log_path, exist_ok=True)
                     pkl.dump(self.log_dict, open(self.log_path + "/log.pkl", "wb"))
@@ -232,6 +273,7 @@ class MC_PILCO(torch.nn.Module):
                 self.log_dict["parameters_trial_list"] = parameters_trial_list
                 self.log_dict["particles_states_list"] = particles_states_list
                 self.log_dict["particles_inputs_list"] = particles_inputs_list
+                self.log_dict["exogenous_samples_history"] = self.exogenous_samples_history
                 pkl.dump(self.log_dict, open(self.log_path + "/log.pkl", "wb"))
             self.model_learning.set_training_mode()
 
@@ -273,6 +315,7 @@ class MC_PILCO(torch.nn.Module):
                 self.log_dict["state_samples_history"] = self.state_samples_history
                 self.log_dict["input_samples_history"] = self.input_samples_history
                 self.log_dict["noiseless_states_history"] = self.noiseless_states_history
+                self.log_dict["exogenous_samples_history"] = self.exogenous_samples_history
                 pkl.dump(self.log_dict, open(self.log_path + "/log.pkl", "wb"))
 
             print("\n\n----- CHECK THE MODEL LEARNING PERFORMANCE (before model update) -----")
@@ -301,6 +344,7 @@ class MC_PILCO(torch.nn.Module):
                 self.input_samples_history[data_collection_index], dtype=self.dtype, device=self.device
             ),
             flg_pretrain=flg_pretrain,
+            exogenous_inputs=self._get_exogenous_history_tensor(data_collection_index),
         )
         for i in range(self.model_learning.num_gp):
             gp_output_var_list[i] = gp_output_var_list[i] * self.model_learning.norm_list[i] ** 2
@@ -385,6 +429,7 @@ class MC_PILCO(torch.nn.Module):
         inputs_trajectory_tc = torch.tensor(
             self.input_samples_history[data_collection_index], dtype=self.dtype, device=self.device
         )
+        exogenous_trajectory_tc = self._get_exogenous_history_tensor(data_collection_index)
         # allocate the space for the rollout trajectory
         rollout_trj = torch.zeros([T_rollout, self.state_dim], dtype=self.dtype, device=self.device)
         rollout_trj[0:1, :] = current_state_tc
@@ -395,6 +440,7 @@ class MC_PILCO(torch.nn.Module):
                 current_state=rollout_trj[t - 1 : t, :],
                 current_input=inputs_trajectory_tc[t - 1 : t, :],
                 particle_pred=particle_pred,
+                exogenous_input=None if exogenous_trajectory_tc is None else exogenous_trajectory_tc[t - 1 : t, :],
             )
         return rollout_trj.detach().cpu().numpy()
 
@@ -684,12 +730,15 @@ class MC_PILCO(torch.nn.Module):
 
         # compute initial inputs
         inputs_sequence_list.append(self.control_policy(states_sequence_list[0], t=0, p_dropout=p_dropout))
+        exogenous_sequence = self.sample_exogenous_sequence(int(T_control), num_particles)
 
         for t in range(1, int(T_control)):
 
             # get next state mean and variance (given the states sampled and the inputs computed)
             particles, _, _ = self.model_learning.get_next_state(
-                current_state=states_sequence_list[t - 1], current_input=inputs_sequence_list[t - 1]
+                current_state=states_sequence_list[t - 1],
+                current_input=inputs_sequence_list[t - 1],
+                exogenous_input=None if exogenous_sequence is None else exogenous_sequence[t - 1],
             )
             states_sequence_list.append(particles)
 
@@ -756,13 +805,22 @@ class MC_PILCO(torch.nn.Module):
             state_samples = log_dict["state_samples_history"][j]
             input_samples = log_dict["input_samples_history"][j]
             noiseless_state_samples = log_dict["noiseless_states_history"][j]
+            if self._uses_exogenous_inputs():
+                exogenous_state_samples = log_dict.get("exogenous_samples_history", [None] * (num_trial + 1))[j]
+            else:
+                exogenous_state_samples = None
             # add samples history
             self.state_samples_history.append(state_samples)
             self.input_samples_history.append(input_samples)
             self.noiseless_states_history.append(noiseless_state_samples)
+            self.exogenous_samples_history.append(exogenous_state_samples)
             self.num_data_collection += 1
             # add data to model_learning object
-            self.model_learning.add_data(new_state_samples=state_samples, new_input_samples=input_samples)
+            self.model_learning.add_data(
+                new_state_samples=state_samples,
+                new_input_samples=input_samples,
+                new_exogenous_samples=exogenous_state_samples,
+            )
 
         trial_index = num_trial - 1
 

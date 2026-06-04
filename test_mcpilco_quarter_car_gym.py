@@ -73,8 +73,21 @@ p.add_argument("-G0", type=float, default=0.001024, help="Evaluation road roughn
 p.add_argument("-G0_min", type=float, default=0.000256, help="Minimum randomized road roughness coefficient.")
 p.add_argument("-G0_max", type=float, default=0.001024, help="Maximum randomized road roughness coefficient.")
 p.add_argument("-road_seed", type=int, default=827538, help="Base road seed.")
+p.add_argument(
+    "-validation_road_seed",
+    type=int,
+    default=None,
+    help="Fixed road seed used only for validation rollouts. Defaults to road_seed + 1000000.",
+)
+p.add_argument("-validation_G0", type=float, default=None, help="Fixed validation G0. Defaults to G0.")
+p.add_argument("-disable_validation_rollout", action="store_true", help="Disable fixed-road validation rollouts.")
 p.add_argument("-Road_Type", type=str, default="Random", choices=["Sine", "Chirp", "Random", "Bump"], help="Road type.")
 p.add_argument("-road_velocity", type=float, default=20.0, help="Road velocity parameter.")
+p.add_argument(
+    "-disable_road_gp_input",
+    action="store_true",
+    help="Disable road-aware GP inputs. By default GP uses [z_r, z_r_dot] from Gym info; policy still does not.",
+)
 p.add_argument("-as_max", type=float, default=1.0, help="Sprung acceleration safety limit.")
 p.add_argument("-deflec_max", type=float, default=0.04, help="Suspension deflection safety limit.")
 p.add_argument("-punish_Q_acc_s", type=float, default=10.0, help="Reward weight for sprung acceleration.")
@@ -85,7 +98,31 @@ p.add_argument("-punish_Q_delta_F", type=float, default=5.0, help="Reward weight
 p.add_argument("-punish_Q_flec_t", type=float, default=1.0, help="Reward weight for tire deflection.")
 p.add_argument("-punish_Q_acc_s_h", type=float, default=2.5, help="High-frequency sprung-acceleration reward weight.")
 p.add_argument("-punish_Q_b_defelc", type=float, default=-80.0, help="Reward barrier weight for deflection.")
+p.add_argument("-cost_l0", type=float, default=1.0, help="Cost function lengthscale for sprung acceleration.")
+p.add_argument("-cost_l1", type=float, default=0.1, help="Cost function lengthscale for sprung velocity.")
+p.add_argument("-cost_l2", type=float, default=1.0, help="Cost function lengthscale for suspension deflection.")
+p.add_argument("-cost_l3", type=float, default=1.0, help="Cost function lengthscale for deflection velocity.")
+p.add_argument(
+    "-use_suspension_cost", action="store_true", help="Use the new physics-aligned suspension evaluation cost function."
+)
+p.add_argument("-w_acc", type=float, default=0.4, help="Comfort weight.")
+p.add_argument("-w_tire", type=float, default=0.4, help="Road holding weight.")
+p.add_argument("-w_barrier", type=float, default=0.2, help="Safety barrier weight.")
+p.add_argument("-l_acc", type=float, default=1.5, help="Comfort acceleration scale.")
+p.add_argument("-l_tire", type=float, default=0.006, help="Tire deflection scale.")
+p.add_argument("-d_barrier", type=float, default=0.035, help="Safety barrier displacement threshold.")
+p.add_argument("-beta_barrier", type=float, default=150.0, help="Safety barrier steepness coefficient.")
+p.add_argument(
+    "-device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Computation device (cpu or cuda)"
+)
+p.add_argument("-num_threads", type=int, default=4, help="Number of CPU threads for PyTorch")
 locals().update(vars(p.parse_known_args()[0]))
+
+use_road_gp_input = not disable_road_gp_input
+if validation_road_seed is None:
+    validation_road_seed = road_seed + 1000000
+if validation_G0 is None:
+    validation_G0 = G0
 
 
 def safe_path_name(value):
@@ -121,10 +158,13 @@ np.random.seed(seed)
 dtype = torch.float64
 
 # 设置设备
-device = torch.device("cpu")
+device = torch.device(device)
+if device.type == "cuda" and not torch.cuda.is_available():
+    print("\n[WARNING] CUDA is specified but not available in this PyTorch installation.")
+    print("Please make sure PyTorch is installed with CUDA support. Falling back to CPU for now.")
+    device = torch.device("cpu")
 
 # 设置计算线程数
-num_threads = 1
 torch.set_num_threads(num_threads)
 
 print("---- 创建GOPS Gym环境 ----")
@@ -175,13 +215,16 @@ print("\n---- 设置环境参数 ----")
 state_dim = 4  # Gym observation: [acc_s, vs, suspension_deflection, v_def] / obs_scaling
 input_dim = 1  # Gym action; physical force = action / act_scaling
 num_gp = state_dim  # Model every Gym observation delta directly
-gp_input_dim = state_dim + input_dim
+road_gp_input_dim = 2 if use_road_gp_input else 0  # [z_r, z_r_dot] for GP only
+gp_input_dim = state_dim + input_dim + road_gp_input_dim
 u_max = float(gym_env.action_space.high[0])  # Normalized Gym action limit
 std_list = std_noise * np.ones(state_dim)  # 所有状态维度的噪声
 fl_SOD_GP = True  # 是否在GP中使用数据子集(SOD)近似
 
 print("\n---- 设置模型学习参数 ----")
-f_model_learning = ML.Model_learning_RBF_angle_state
+f_model_learning = (
+    ML.Model_learning_RBF_angle_state_with_exogenous if use_road_gp_input else ML.Model_learning_RBF_angle_state
+)
 model_learning_par = {}
 model_learning_par["num_gp"] = num_gp
 model_learning_par["angle_indeces"] = []
@@ -232,11 +275,24 @@ control_policy_par["dtype"] = dtype
 control_policy_par["device"] = device
 
 print("\n---- 设置代价函数参数 ----")
-f_cost_function = Cost_function.Expected_saturated_distance
-cost_function_par = {}
-cost_function_par["target_state"] = torch.zeros(state_dim, dtype=dtype, device=device)
-cost_function_par["lengthscales"] = torch.tensor([1.0, 0.1, 1.0, 1.0], dtype=dtype, device=device)
-cost_function_par["active_dims"] = np.arange(state_dim)
+if use_suspension_cost:
+    f_cost_function = Cost_function.Expected_suspension_evaluation_cost
+    cost_function_par = {
+        "w_acc": w_acc,
+        "w_tire": w_tire,
+        "w_barrier": w_barrier,
+        "l_acc": l_acc,
+        "l_tire": l_tire,
+        "d_barrier": d_barrier,
+        "beta": beta_barrier,
+        "obs_scaling": env_config["obs_scaling"],
+    }
+else:
+    f_cost_function = Cost_function.Expected_saturated_distance
+    cost_function_par = {}
+    cost_function_par["target_state"] = torch.zeros(state_dim, dtype=dtype, device=device)
+    cost_function_par["lengthscales"] = torch.tensor([cost_l0, cost_l1, cost_l2, cost_l3], dtype=dtype, device=device)
+    cost_function_par["active_dims"] = np.arange(state_dim)
 
 print("\n---- 设置初始状态 ----")
 initial_state = np.array([0.0, 0.0, 0.0, 0.0])  # Physical reset state [xs, vs, xu, vu]
@@ -261,9 +317,13 @@ print("\n---- 初始化 MC-PILCO-Gym ----")
 resolved_run_name = (
     safe_path_name(run_name) if run_name else build_run_name(env_config, control_policy_par, policy_optimization_dict)
 )
+if run_name is None and use_road_gp_input:
+    resolved_run_name = safe_path_name(resolved_run_name + "_roadgp")
 log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name)
 if os.path.isdir(log_path) and os.listdir(log_path) and not overwrite_existing:
-    raise FileExistsError("结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path))
+    raise FileExistsError(
+        "结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path)
+    )
 os.makedirs(log_path, exist_ok=True)
 experiment_info = {
     "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -286,6 +346,23 @@ experiment_info = {
         "lr_list": policy_optimization_dict["lr_list"],
         "opt_steps_list": policy_optimization_dict["opt_steps_list"],
         "p_dropout_list": policy_optimization_dict["p_dropout_list"],
+        "cost_l0": cost_l0,
+        "cost_l1": cost_l1,
+        "cost_l2": cost_l2,
+        "cost_l3": cost_l3,
+        "use_road_gp_input": use_road_gp_input,
+        "road_gp_input_dim": road_gp_input_dim,
+        "enable_validation_rollout": not disable_validation_rollout,
+        "validation_road_seed": validation_road_seed,
+        "validation_G0": validation_G0,
+        "use_suspension_cost": use_suspension_cost,
+        "w_acc": w_acc,
+        "w_tire": w_tire,
+        "w_barrier": w_barrier,
+        "l_acc": l_acc,
+        "l_tire": l_tire,
+        "d_barrier": d_barrier,
+        "beta_barrier": beta_barrier,
     },
 }
 print("结果目录:", log_path)
@@ -310,6 +387,10 @@ mc_pilco = MC_PILCO_gym.MC_PILCO_gym(
     deterministic_resets=True,
     base_road_seed=env_config["road_seed"],
     eval_G0=env_config["G0"],
+    enable_validation_rollout=not disable_validation_rollout,
+    validation_road_seed=validation_road_seed,
+    validation_G0=validation_G0,
+    validation_initial_state=initial_state,
 )
 
 print("\n---- 保存测试配置 ----")
@@ -318,6 +399,11 @@ MC_PILCO_init_dict["T_sampling"] = T_sampling
 MC_PILCO_init_dict["state_dim"] = state_dim
 MC_PILCO_init_dict["input_dim"] = input_dim
 MC_PILCO_init_dict["gym_env"] = str(type(gym_env))
+MC_PILCO_init_dict["use_road_gp_input"] = use_road_gp_input
+MC_PILCO_init_dict["road_gp_input_dim"] = road_gp_input_dim
+MC_PILCO_init_dict["enable_validation_rollout"] = not disable_validation_rollout
+MC_PILCO_init_dict["validation_road_seed"] = validation_road_seed
+MC_PILCO_init_dict["validation_G0"] = validation_G0
 MC_PILCO_init_dict["f_model_learning"] = f_model_learning
 MC_PILCO_init_dict["model_learning_par"] = model_learning_par
 MC_PILCO_init_dict["f_rand_exploration_policy"] = f_rand_exploration_policy
