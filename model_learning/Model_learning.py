@@ -60,6 +60,7 @@ class Model_learning(torch.nn.Module):
         self.num_samples = 0
         self.dtype = dtype
         self.device = device
+        self.use_exogenous_inputs = False
         self.init_dict_list = init_dict_list
         # Get the gp list
         self.num_gp = num_gp
@@ -120,23 +121,42 @@ class Model_learning(torch.nn.Module):
         for gp in self.gp_list:
             gp.set_training_mode()
 
-    def add_data(self, new_state_samples, new_input_samples):
+    def _data_to_gp_io_with_optional_exogenous(self, states, inputs, exogenous_inputs=None):
+        if exogenous_inputs is None:
+            return self.data_to_gp_IO(states, inputs)
+        return self.data_to_gp_IO(states, inputs, exogenous_inputs=exogenous_inputs)
+
+    def _data_to_gp_input_with_optional_exogenous(self, states, inputs, exogenous_inputs=None):
+        if exogenous_inputs is None:
+            return self.data_to_gp_input(states=states, inputs=inputs)
+        return self.data_to_gp_input(states=states, inputs=inputs, exogenous_inputs=exogenous_inputs)
+
+    def add_data(self, new_state_samples, new_input_samples, new_exogenous_samples=None):
         """
         Transform state_sample and input samples in input-output of the gp and store them
         """
+        state_tensor = torch.tensor(new_state_samples, dtype=self.dtype, device=self.device)
+        input_tensor = torch.tensor(new_input_samples, dtype=self.dtype, device=self.device)
+        if new_exogenous_samples is None:
+            exogenous_tensor = None
+        else:
+            exogenous_tensor = torch.tensor(new_exogenous_samples, dtype=self.dtype, device=self.device)
+
         if self.num_samples == 0:
             self.dim_state = new_state_samples.shape[1]
-            self.gp_inputs, self.gp_output_list = self.data_to_gp_IO(
-                torch.tensor(new_state_samples, dtype=self.dtype, device=self.device),
-                torch.tensor(new_input_samples, dtype=self.dtype, device=self.device),
+            self.gp_inputs, self.gp_output_list = self._data_to_gp_io_with_optional_exogenous(
+                state_tensor,
+                input_tensor,
+                exogenous_tensor,
             )
             self.num_samples = new_state_samples.shape[0]
             _, self.dim_input = new_input_samples.shape
         else:
 
-            new_gp_inputs, new_gp_output_list = self.data_to_gp_IO(
-                torch.tensor(new_state_samples, dtype=self.dtype, device=self.device),
-                torch.tensor(new_input_samples, dtype=self.dtype, device=self.device),
+            new_gp_inputs, new_gp_output_list = self._data_to_gp_io_with_optional_exogenous(
+                state_tensor,
+                input_tensor,
+                exogenous_tensor,
             )
             # update samples set
             self.gp_inputs = torch.cat([self.gp_inputs, (new_gp_inputs)])
@@ -207,14 +227,14 @@ class Model_learning(torch.nn.Module):
             self.gp_inputs_tr_list[gp_index] = self.gp_inputs
         print("MSE gp " + str(gp_index) + ": ", torch.mean((self.gp_output_list[gp_index] - Y_hat) ** 2))
 
-    def get_next_state(self, current_state, current_input, particle_pred=True):
+    def get_next_state(self, current_state, current_input, particle_pred=True, exogenous_input=None):
         """
         Predict the next state given the the current state-input (batches supported).
         Method returns next state samples, together with mean and variance of the gp prediction
         """
         # Get the gp estimate
         _, _, gp_output_mean_list, gp_output_var_list = self.get_one_step_gp_out(
-            states=current_state, inputs=current_input
+            states=current_state, inputs=current_input, exogenous_input=exogenous_input
         )
 
         for i in range(self.num_gp):
@@ -228,12 +248,14 @@ class Model_learning(torch.nn.Module):
             particle_pred=particle_pred,
         )
 
-    def get_one_step_gp_out(self, states, inputs):
+    def get_one_step_gp_out(self, states, inputs, exogenous_input=None):
         """
         Compute input-output of the gp and performs estimation:
         The function returns (gp_inputs, gp_outputs, gp_mean_hat, gp_var_hat)
         """
-        gp_inputs = self.data_to_gp_input(states=states, inputs=inputs)
+        gp_inputs = self._data_to_gp_input_with_optional_exogenous(
+            states=states, inputs=inputs, exogenous_inputs=exogenous_input
+        )
         gp_outputs_list = None
         # get gp estimates
         gp_output_mean_list, gp_output_var_list = self.get_gp_estimate(
@@ -241,7 +263,9 @@ class Model_learning(torch.nn.Module):
         )
         return gp_inputs, gp_outputs_list, gp_output_mean_list, gp_output_var_list
 
-    def get_gp_estimate_from_data(self, states, inputs, flg_pretrain=False, gp_index_list=None, flg_onestep=False):
+    def get_gp_estimate_from_data(
+        self, states, inputs, flg_pretrain=False, gp_index_list=None, flg_onestep=False, exogenous_inputs=None
+    ):
         """
         Compute input-output of the gp and performs estimation:
         The function returns (gp_inputs, gp_outputs, gp_mean_hat, gp_var_hat)
@@ -250,10 +274,14 @@ class Model_learning(torch.nn.Module):
         if gp_index_list is None:
             gp_index_list = range(0, self.num_gp)
         if flg_onestep:  # get one-step gp estimates
-            gp_inputs = self.data_to_gp_input(states=states, inputs=inputs)
+            gp_inputs = self._data_to_gp_input_with_optional_exogenous(
+                states=states, inputs=inputs, exogenous_inputs=exogenous_inputs
+            )
             gp_outputs_list = None
         else:  # get the input-output of the gp
-            gp_inputs, gp_outputs_list = self.data_to_gp_IO(states=states, inputs=inputs)
+            gp_inputs, gp_outputs_list = self._data_to_gp_io_with_optional_exogenous(
+                states=states, inputs=inputs, exogenous_inputs=exogenous_inputs
+            )
         # pretrain gp
         if flg_pretrain:
             for gp_index in gp_index_list:
@@ -462,11 +490,14 @@ class Model_learning(torch.nn.Module):
         """
         return [(states[1:, i] - states[:-1, i]).reshape([-1, 1]) for i in range(0, self.dim_state)]
 
-    def data_to_gp_IO(self, states, inputs):
+    def data_to_gp_IO(self, states, inputs, exogenous_inputs=None):
         """
         Returns the GP dataset given states and inputs
         """
-        return self.data_to_gp_input(states, inputs)[:-1, :], self.data_to_gp_output(states)
+        return (
+            self._data_to_gp_input_with_optional_exogenous(states, inputs, exogenous_inputs)[:-1, :],
+            self.data_to_gp_output(states),
+        )
 
     def get_next_state_from_gp_output(
         self, current_state, current_input, gp_output_mean_list, gp_output_var_list, particle_pred=True
@@ -577,6 +608,45 @@ class Model_learning_RBF_angle_state(Model_learning):
         )
 
         return torch.cat([extended_states, inputs], 1)
+
+
+class Model_learning_RBF_angle_state_with_exogenous(Model_learning_RBF_angle_state):
+    """
+    RBF model learning with known exogenous inputs appended to the GP input.
+    The control policy still sees only the measured state; exogenous inputs are
+    used only by the learned dynamics model.
+    """
+
+    def __init__(
+        self,
+        num_gp,
+        init_dict_list,
+        angle_indeces,
+        not_angle_indeces,
+        approximation_mode=None,
+        approximation_dict=None,
+        dtype=torch.float64,
+        device=torch.device("cpu"),
+        flg_norm=False,
+    ):
+        super(Model_learning_RBF_angle_state_with_exogenous, self).__init__(
+            num_gp=num_gp,
+            init_dict_list=init_dict_list,
+            angle_indeces=angle_indeces,
+            not_angle_indeces=not_angle_indeces,
+            approximation_mode=approximation_mode,
+            approximation_dict=approximation_dict,
+            dtype=dtype,
+            device=device,
+            flg_norm=flg_norm,
+        )
+        self.use_exogenous_inputs = True
+
+    def data_to_gp_input(self, states, inputs, exogenous_inputs=None):
+        if exogenous_inputs is None:
+            raise ValueError("exogenous_inputs must be provided for road-aware GP model learning.")
+        base_inputs = super(Model_learning_RBF_angle_state_with_exogenous, self).data_to_gp_input(states, inputs)
+        return torch.cat([base_inputs, exogenous_inputs], 1)
 
 
 class Model_learning_RBF_MPK_angle_state(Model_learning_RBF_angle_state):
