@@ -201,6 +201,19 @@ body {
     border-radius: 30px;
 }
 
+.version-badge {
+    max-width: 420px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.03);
+    padding: 6px 10px;
+    border-radius: 30px;
+}
+
 /* ==========================================================================
    App Grid & Cards
    ========================================================================== */
@@ -882,10 +895,28 @@ textarea {
    Footer
    ========================================================================== */
 .app-footer {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 10px 14px;
     text-align: center;
     font-size: 10.5px;
     color: var(--text-muted);
     margin-top: 10px;
+}
+
+.app-footer p {
+    margin: 0;
+}
+
+.app-footer .version-badge {
+    max-width: 100%;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.4;
 }
 
 /* ==========================================================================

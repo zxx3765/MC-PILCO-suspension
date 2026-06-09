@@ -16,12 +16,21 @@ import time
 import subprocess
 import threading
 import pickle as pkl
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
 # 工作目录设置
 WORKSPACE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(WORKSPACE, "launcher_configs")
+DASHBOARD_VERSION = "2026.06.09.1"
+SERVER_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
+LEADERBOARD_BASE_FIELDNAMES = [
+    "label", "lr", "model_epochs", "opt_steps", "num_trials",
+    "rms_acc", "rms_travel", "rms_tire", "rms_u", "eval_cost", "final_trial"
+]
+LEADERBOARD_META_FIELDNAMES = ["entry_id", "added_at"]
+LEADERBOARD_FIELDNAMES = LEADERBOARD_BASE_FIELDNAMES + LEADERBOARD_META_FIELDNAMES
 
 # 参数定义对照表，以保证与原 GUI launcher 保存的 JSON 文件完全兼容
 TRAIN_FIELDS_SPEC = [
@@ -92,6 +101,7 @@ TRAIN_FIELDS_SPEC = [
 # 全局共享状态
 sweep_process = None
 sweep_thread = None
+sweep_process_lock = threading.Lock()
 sweep_status = {
     "running": False,
     "current_idx": 0,
@@ -155,6 +165,85 @@ def evaluate_run(result_dir):
     }
 
 
+def eval_cost_sort_key(row):
+    try:
+        value = float(row.get("eval_cost", float("inf")))
+    except (TypeError, ValueError):
+        return float("inf")
+    return value if value == value else float("inf")
+
+
+def create_leaderboard_entry_id():
+    return f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+
+def get_leaderboard_fieldnames(existing_fieldnames=None):
+    fieldnames = list(LEADERBOARD_FIELDNAMES)
+    for name in existing_fieldnames or []:
+        if name and name not in fieldnames:
+            fieldnames.append(name)
+    return fieldnames
+
+
+def read_leaderboard_csv(csv_path):
+    rows = []
+    existing_fieldnames = []
+    if not os.path.exists(csv_path):
+        return rows, existing_fieldnames
+
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        existing_fieldnames = reader.fieldnames or []
+        fieldnames = get_leaderboard_fieldnames(existing_fieldnames)
+        for row_index, row in enumerate(reader):
+            clean_row = {k: row.get(k, "") for k in fieldnames}
+            clean_row["_row_index"] = row_index
+            rows.append(clean_row)
+    return rows, existing_fieldnames
+
+
+def make_leaderboard_row(metrics, fieldnames=None):
+    fieldnames = get_leaderboard_fieldnames(fieldnames)
+    row = {k: "" for k in fieldnames}
+    row.update({k: str(metrics.get(k, "")) for k in LEADERBOARD_BASE_FIELDNAMES})
+    row["entry_id"] = str(metrics.get("entry_id") or create_leaderboard_entry_id())
+    row["added_at"] = str(metrics.get("added_at") or time.strftime("%Y-%m-%d %H:%M:%S"))
+    return row
+
+
+def write_leaderboard_csv(csv_path, rows, existing_fieldnames=None):
+    fieldnames = get_leaderboard_fieldnames(existing_fieldnames)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    rows_to_write = []
+    for row in rows:
+        row_to_write = {k: str(row.get(k, "")) for k in fieldnames}
+        if not row_to_write.get("entry_id"):
+            row_to_write["entry_id"] = create_leaderboard_entry_id()
+        if not row_to_write.get("added_at"):
+            row_to_write["added_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        rows_to_write.append(row_to_write)
+
+    rows_to_write.sort(key=eval_cost_sort_key)
+
+    tmp_path = csv_path + ".tmp"
+    try:
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows_to_write)
+    except Exception as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"Failed to write leaderboard CSV {csv_path}: {e}") from e
+
+    os.replace(tmp_path, csv_path)
+    return len(rows_to_write)
+
+
 def extract_run_parameters_and_metrics(run_dir):
     """从 config_log.pkl 和 validation_metrics.pkl 中解析参数与物理指标"""
     metrics = evaluate_run(run_dir)
@@ -215,36 +304,67 @@ def extract_run_parameters_and_metrics(run_dir):
     return metrics
 
 
-def append_results_to_csv(csv_path, metrics):
-    """向 csv 结果表中追加入单次运行数据，自动更新已有标签行"""
-    fieldnames = ["label", "lr", "model_epochs", "opt_steps", "num_trials", 
-                  "rms_acc", "rms_travel", "rms_tire", "rms_u", "eval_cost", "final_trial"]
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    rows = []
-    exists = False
-    if os.path.exists(csv_path):
-        try:
-            with open(csv_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row.get("label") == metrics["label"]:
-                        row.update({k: str(metrics.get(k, "")) for k in fieldnames})
-                        exists = True
-                    rows.append(row)
-        except Exception:
-            pass
-            
-    if not exists:
-        new_row = {k: str(metrics.get(k, "")) for k in fieldnames}
-        rows.append(new_row)
-        
+def append_results_to_csv(csv_path, metrics, update_existing=False):
+    """Write one run to a leaderboard CSV.
+
+    update_existing=True keeps the historical upsert behavior for automatic writes.
+    update_existing=False always creates a new ranked entry, even when labels match.
+    """
+    rows, existing_fieldnames = read_leaderboard_csv(csv_path)
+    label = str(metrics.get("label", ""))
+    updated_existing = False
+
+    if update_existing:
+        for row in rows:
+            if row.get("label") == label:
+                row.update({k: str(metrics.get(k, "")) for k in LEADERBOARD_BASE_FIELDNAMES})
+                updated_existing = True
+                break
+
+    if not updated_existing:
+        rows.append(make_leaderboard_row(metrics, existing_fieldnames))
+
+    return write_leaderboard_csv(csv_path, rows, existing_fieldnames)
+
+
+def terminate_process(process, timeout=5.0):
+    if process is None:
+        return False
+    if process.poll() is not None:
+        return True
+
+    process.terminate()
     try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
+        process.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
+        return True
+
+
+def cleanup_background_task(reason="shutdown"):
+    global sweep_process, sweep_status
+    with sweep_process_lock:
+        process = sweep_process
+        sweep_process = None
+
+    if process is None:
+        return False
+
+    try:
+        terminate_process(process)
+        sweep_status["status"] = "已中止"
+        sweep_status["running"] = False
+        console_logs.append(f"[Server] background task terminated during {reason}")
+        if len(console_logs) > 60:
+            console_logs.pop(0)
+        return True
     except Exception as e:
-        print(f"[Backend Error] Failed to write CSV: {e}")
+        console_logs.append(f"[Server] failed to terminate background task during {reason}: {e}")
+        if len(console_logs) > 60:
+            console_logs.pop(0)
+        return False
 
 
 def run_sweep_thread(cmd):
@@ -253,11 +373,12 @@ def run_sweep_thread(cmd):
     console_logs.clear()
     sweep_status["running"] = True
     sweep_status["status"] = "启动中"
+    process = None
     
     try:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
-        sweep_process = subprocess.Popen(
+        process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -267,9 +388,11 @@ def run_sweep_thread(cmd):
             errors="replace",
             bufsize=1
         )
+        with sweep_process_lock:
+            sweep_process = process
         
-        assert sweep_process.stdout is not None
-        for line in sweep_process.stdout:
+        assert process.stdout is not None
+        for line in process.stdout:
             line_strip = line.strip()
             if not line_strip:
                 continue
@@ -285,13 +408,15 @@ def run_sweep_thread(cmd):
                     if k in parsed:
                         sweep_status[k] = parsed[k]
                         
-        sweep_process.wait()
+        process.wait()
     except Exception as e:
         console_logs.append(f"[Server Thread Error] {e}")
     finally:
         sweep_status["running"] = False
-        sweep_status["status"] = "已结束" if sweep_process and sweep_process.returncode == 0 else "已中止"
-        sweep_process = None
+        sweep_status["status"] = "已结束" if process and process.returncode == 0 else "已中止"
+        with sweep_process_lock:
+            if sweep_process is process:
+                sweep_process = None
 
 
 def run_single_thread(cmd, script_name, params):
@@ -302,6 +427,7 @@ def run_single_thread(cmd, script_name, params):
     console_logs.clear()
     sweep_status["running"] = True
     sweep_status["status"] = "启动中"
+    process = None
     sweep_status["total_configs"] = 1
     sweep_status["current_idx"] = 0
     sweep_status["completed"] = []
@@ -337,7 +463,7 @@ def run_single_thread(cmd, script_name, params):
     try:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
-        sweep_process = subprocess.Popen(
+        process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -347,9 +473,11 @@ def run_single_thread(cmd, script_name, params):
             errors="replace",
             bufsize=1
         )
+        with sweep_process_lock:
+            sweep_process = process
         
-        assert sweep_process.stdout is not None
-        for line in sweep_process.stdout:
+        assert process.stdout is not None
+        for line in process.stdout:
             line_strip = line.strip()
             if not line_strip:
                 continue
@@ -396,7 +524,7 @@ def run_single_thread(cmd, script_name, params):
             
             sweep_status["elapsed"] = time.time() - start_time
             
-        return_code = sweep_process.wait()
+        return_code = process.wait()
         
         if return_code == 0:
             # 自动进行绘图验证生成 validation_metrics.pkl
@@ -453,7 +581,12 @@ def run_single_thread(cmd, script_name, params):
                 
                 # Write metrics to the persistent dashboard leaderboard.
                 csv_path = os.path.join(WORKSPACE, result_root, "hyperparameter_tuning_results.csv")
-                append_results_to_csv(csv_path, metrics)
+                try:
+                    append_results_to_csv(csv_path, metrics, update_existing=False)
+                except Exception as e:
+                    console_logs.append(f"[Leaderboard Error] {e}")
+                    if len(console_logs) > 60:
+                        console_logs.pop(0)
                 
             sweep_status["status"] = "已结束"
         else:
@@ -464,7 +597,9 @@ def run_single_thread(cmd, script_name, params):
         sweep_status["status"] = "错误"
     finally:
         sweep_status["running"] = False
-        sweep_process = None
+        with sweep_process_lock:
+            if sweep_process is process:
+                sweep_process = None
 
 
 def append_suffix_once(value, suffix):
@@ -529,6 +664,29 @@ def resolve_result_root_path(result_root):
     if os.path.isabs(result_root):
         return result_root
     return os.path.normpath(os.path.join(WORKSPACE, result_root))
+
+
+def get_leaderboard_csv_path(result_root, leaderboard):
+    result_root_path = resolve_result_root_path(result_root)
+    if leaderboard == "default":
+        csv_filename = "leaderboard_default.csv"
+    else:
+        leaderboard_safe = re.sub(r"[^0-9A-Za-z._-]+", "_", leaderboard).strip("._-")
+        csv_filename = f"leaderboard_{leaderboard_safe}.csv"
+    csv_path = os.path.join(result_root_path, csv_filename)
+    
+    # 自动迁移历史默认排行榜数据
+    if leaderboard == "default" and not os.path.exists(csv_path):
+        legacy_path = os.path.join(result_root_path, "hyperparameter_tuning_results.csv")
+        if os.path.exists(legacy_path):
+            try:
+                import shutil
+                shutil.copyfile(legacy_path, csv_path)
+                print(f"[Leaderboard Migration] Copied legacy default leaderboard {legacy_path} to {csv_path}")
+            except Exception as e:
+                print(f"[Leaderboard Migration Error] Failed to migrate default leaderboard: {e}")
+                
+    return csv_path
 
 
 def run_has_visible_artifact(run_dir):
@@ -642,6 +800,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed_path == "/api/status":
             response_data = dict(sweep_status)
             response_data["console_feed"] = console_logs
+            response_data["server_pid"] = os.getpid()
+            response_data["server_started_at"] = SERVER_STARTED_AT
+            response_data["dashboard_version"] = DASHBOARD_VERSION
+            response_data["workspace"] = WORKSPACE
             self.send_json(response_data)
             
         # 3. 历史数据读取 API
@@ -649,27 +811,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             result_root = query_params.get("result_root", "./results_tmp/quarter_car_gym")
             leaderboard = query_params.get("leaderboard", "default")
             
-            if leaderboard == "default":
-                csv_filename = "hyperparameter_tuning_results.csv"
-            else:
-                leaderboard_safe = re.sub(r"[^0-9A-Za-z._-]+", "_", leaderboard).strip("._-")
-                csv_filename = f"leaderboard_{leaderboard_safe}.csv"
-                
-            csv_path = os.path.join(WORKSPACE, result_root, csv_filename)
+            csv_path = get_leaderboard_csv_path(result_root, leaderboard)
             if os.path.exists(csv_path):
-                history_data = []
                 try:
-                    with open(csv_path, "r", encoding="utf-8") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            for num_field in ["lr", "model_epochs", "opt_steps", "num_trials", 
-                                              "rms_acc", "rms_travel", "rms_tire", "rms_u", "eval_cost"]:
-                                if num_field in row:
-                                    try:
-                                        row[num_field] = float(row[num_field])
-                                    except ValueError:
-                                        pass
-                            history_data.append(row)
+                    history_data, _ = read_leaderboard_csv(csv_path)
+                    for row in history_data:
+                        for num_field in ["lr", "model_epochs", "opt_steps", "num_trials",
+                                          "rms_acc", "rms_travel", "rms_tire", "rms_u", "eval_cost"]:
+                            if num_field in row:
+                                try:
+                                    row[num_field] = float(row[num_field])
+                                except ValueError:
+                                    pass
+                    history_data.sort(key=eval_cost_sort_key)
                     self.send_json({"success": True, "results": history_data})
                 except Exception as e:
                     self.send_json({"success": False, "error": str(e)}, 500)
@@ -690,7 +844,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                 continue
                             elif filename.startswith("leaderboard_"):
                                 name = filename[len("leaderboard_"):-4]
-                                if name:
+                                if name and name != "default":
                                     leaderboards.append(name)
                 except Exception as e:
                     print(f"[Backend Error] Failed to list leaderboards: {e}")
@@ -906,9 +1060,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"success": False, "message": "当前没有正在运行的后台任务。"}, 400)
                 return
             try:
-                sweep_process.terminate()
-                sweep_process = None
-                self.send_json({"success": True, "message": "后台任务已终止。"})
+                stopped = cleanup_background_task("api stop")
+                if stopped:
+                    self.send_json({"success": True, "message": "后台任务已终止。"})
+                else:
+                    self.send_json({"success": False, "message": "后台任务终止失败。"}, 500)
             except Exception as e:
                 self.send_json({"success": False, "message": f"终止任务失败: {e}"}, 500)
 
@@ -943,7 +1099,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"success": False, "error": str(e)}, 500)
                 
-        # 4.8 上传当次运行结果到持久排行榜 API
+        # 4.8 添加当次运行排行榜结果到持久排行榜 API
         elif parsed_path == "/api/leaderboard/upload_current":
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length)
@@ -958,36 +1114,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             
             completed_runs = sweep_status.get("completed", [])
             if not completed_runs:
-                self.send_json({"success": False, "message": "当前没有已完成的运行结果可保存到持久排行榜。"}, 400)
+                self.send_json({"success": False, "message": "当前没有已完成的排行结果可添加到持久排行榜。"}, 400)
                 return
                 
-            if leaderboard == "default":
-                csv_filename = "hyperparameter_tuning_results.csv"
-            else:
-                leaderboard_safe = re.sub(r"[^0-9A-Za-z._-]+", "_", leaderboard).strip("._-")
-                csv_filename = f"leaderboard_{leaderboard_safe}.csv"
-                
-            csv_path = os.path.join(WORKSPACE, result_root, csv_filename)
+            csv_path = get_leaderboard_csv_path(result_root, leaderboard)
             
             uploaded_count = 0
-            for run_metrics in completed_runs:
-                metrics_to_append = {
-                    "label": run_metrics.get("label", ""),
-                    "lr": run_metrics.get("lr", 0.01),
-                    "model_epochs": run_metrics.get("model_epochs", 2),
-                    "opt_steps": run_metrics.get("opt_steps", 100),
-                    "num_trials": run_metrics.get("num_trials", 2),
-                    "rms_acc": run_metrics.get("rms_acc", 0.0),
-                    "rms_travel": run_metrics.get("rms_travel", 0.0),
-                    "rms_tire": run_metrics.get("rms_tire", 0.0),
-                    "rms_u": run_metrics.get("rms_u", 0.0),
-                    "eval_cost": run_metrics.get("eval_cost", 0.0),
-                    "final_trial": run_metrics.get("final_trial", 0)
-                }
-                append_results_to_csv(csv_path, metrics_to_append)
-                uploaded_count += 1
+            try:
+                for run_metrics in sorted(completed_runs, key=eval_cost_sort_key):
+                    metrics_to_append = {
+                        "label": run_metrics.get("label", ""),
+                        "lr": run_metrics.get("lr", 0.01),
+                        "model_epochs": run_metrics.get("model_epochs", 2),
+                        "opt_steps": run_metrics.get("opt_steps", 100),
+                        "num_trials": run_metrics.get("num_trials", 2),
+                        "rms_acc": run_metrics.get("rms_acc", 0.0),
+                        "rms_travel": run_metrics.get("rms_travel", 0.0),
+                        "rms_tire": run_metrics.get("rms_tire", 0.0),
+                        "rms_u": run_metrics.get("rms_u", 0.0),
+                        "eval_cost": run_metrics.get("eval_cost", 0.0),
+                        "final_trial": run_metrics.get("final_trial", 0)
+                    }
+                    append_results_to_csv(csv_path, metrics_to_append, update_existing=False)
+                    uploaded_count += 1
+            except Exception as e:
+                self.send_json({"success": False, "message": f"写入排行榜失败: {e}"}, 500)
+                return
                 
-            self.send_json({"success": True, "message": f"成功将 {uploaded_count} 组运行结果保存到排行榜 {leaderboard}！"})
+            self.send_json({"success": True, "message": f"成功将 {uploaded_count} 组当前排行结果添加到排行榜 {leaderboard}！"})
                 
         # 5. 上传实验结果到排行榜 API
         elif parsed_path == "/api/leaderboard/upload":
@@ -1018,14 +1172,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 
             metrics["label"] = actual_run_name
             
-            if leaderboard == "default":
-                csv_filename = "hyperparameter_tuning_results.csv"
-            else:
-                leaderboard_safe = re.sub(r"[^0-9A-Za-z._-]+", "_", leaderboard).strip("._-")
-                csv_filename = f"leaderboard_{leaderboard_safe}.csv"
-                
-            csv_path = os.path.join(WORKSPACE, result_root, csv_filename)
-            append_results_to_csv(csv_path, metrics)
+            csv_path = get_leaderboard_csv_path(result_root, leaderboard)
+            try:
+                append_results_to_csv(csv_path, metrics, update_existing=False)
+            except Exception as e:
+                self.send_json({"success": False, "message": f"写入排行榜失败: {e}"}, 500)
+                return
             self.send_json({"success": True, "message": f"成功上传实验 {run_name} 至排行榜 {leaderboard}！"})
             
         # 6. 从排行榜中删除单条记录 API
@@ -1039,46 +1191,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
                 
             label = data.get("label")
+            entry_id = str(data.get("entry_id") or "").strip()
+            row_index = data.get("row_index")
             leaderboard = data.get("leaderboard", "default")
             result_root = data.get("result_root", "./results_tmp/quarter_car_gym")
             
-            if not label:
-                self.send_json({"success": False, "message": "缺少要删除的配置标签 (label)。"}, 400)
+            try:
+                row_index = int(row_index) if row_index not in (None, "") else None
+            except (TypeError, ValueError):
+                row_index = None
+            
+            if not label and not entry_id and row_index is None:
+                self.send_json({"success": False, "message": "缺少要删除的排行榜记录标识。"}, 400)
                 return
                 
-            if leaderboard == "default":
-                csv_filename = "hyperparameter_tuning_results.csv"
-            else:
-                leaderboard_safe = re.sub(r"[^0-9A-Za-z._-]+", "_", leaderboard).strip("._-")
-                csv_filename = f"leaderboard_{leaderboard_safe}.csv"
-                
-            csv_path = os.path.join(WORKSPACE, result_root, csv_filename)
+            csv_path = get_leaderboard_csv_path(result_root, leaderboard)
             
             if not os.path.exists(csv_path):
                 self.send_json({"success": False, "message": "排行榜文件不存在。"}, 404)
                 return
                 
-            rows = []
             deleted = False
             try:
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    fieldnames = reader.fieldnames
-                    for row in reader:
-                        if row.get("label") == label:
-                            deleted = True
-                            continue
-                        rows.append(row)
+                rows, existing_fieldnames = read_leaderboard_csv(csv_path)
+                remaining_rows = []
+                for row in rows:
+                    row_matches_entry = entry_id and row.get("entry_id") == entry_id
+                    row_matches_index = row_index is not None and row.get("_row_index") == row_index
+                    row_matches_label = not entry_id and row_index is None and label and row.get("label") == label
+
+                    if not deleted and (row_matches_entry or row_matches_index or row_matches_label):
+                        deleted = True
+                        continue
+                    remaining_rows.append(row)
                         
                 if deleted:
-                    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                        assert fieldnames is not None
-                        writer = csv.DictWriter(f, fieldnames=fieldnames)
-                        writer.writeheader()
-                        writer.writerows(rows)
-                    self.send_json({"success": True, "message": f"已成功从排行榜中删除 {label}。"})
+                    write_leaderboard_csv(csv_path, remaining_rows, existing_fieldnames)
+                    target_name = label or entry_id or str(row_index)
+                    self.send_json({"success": True, "message": f"已成功从排行榜中删除 {target_name}。"})
                 else:
-                    self.send_json({"success": False, "message": f"在排行榜中未找到标签 {label}。"}, 404)
+                    self.send_json({"success": False, "message": "在排行榜中未找到对应记录。"}, 404)
             except Exception as e:
                 self.send_json({"success": False, "error": str(e)}, 500)
                 
@@ -1105,24 +1257,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"success": False, "message": "无效或保留的排行榜名称。"}, 400)
                 return
                 
-            if current_name == "default":
-                src_filename = "hyperparameter_tuning_results.csv"
-            else:
-                src_name_safe = re.sub(r"[^0-9A-Za-z._-]+", "_", current_name).strip("._-")
-                src_filename = f"leaderboard_{src_name_safe}.csv"
-                
-            dst_filename = f"leaderboard_{new_name_safe}.csv"
-            
-            src_path = os.path.join(WORKSPACE, result_root, src_filename)
-            dst_path = os.path.join(WORKSPACE, result_root, dst_filename)
+            src_path = get_leaderboard_csv_path(result_root, current_name)
+            dst_path = get_leaderboard_csv_path(result_root, new_name)
             
             try:
                 os.makedirs(os.path.join(WORKSPACE, result_root), exist_ok=True)
                 if not os.path.exists(src_path):
                     with open(dst_path, "w", newline="", encoding="utf-8") as f:
                         writer = csv.writer(f)
-                        writer.writerow(["label", "lr", "model_epochs", "opt_steps", "num_trials", 
-                                         "rms_acc", "rms_travel", "rms_tire", "rms_u", "eval_cost", "final_trial"])
+                        writer.writerow(LEADERBOARD_FIELDNAMES)
                 else:
                     import shutil
                     shutil.copyfile(src_path, dst_path)
@@ -1143,13 +1286,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             name = data.get("name", "").strip()
             result_root = data.get("result_root", "./results_tmp/quarter_car_gym")
             
-            if not name or name == "default":
-                self.send_json({"success": False, "message": "不能删除默认排行榜。"}, 400)
-                return
-                
-            name_safe = re.sub(r"[^0-9A-Za-z._-]+", "_", name).strip("._-")
-            filename = f"leaderboard_{name_safe}.csv"
-            file_path = os.path.join(WORKSPACE, result_root, filename)
+            file_path = get_leaderboard_csv_path(result_root, name)
             
             if os.path.exists(file_path):
                 try:
@@ -1184,6 +1321,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"404 Static File Not Found")
 
 
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
 def main():
     parser = argparse.ArgumentParser("MC-PILCO Web Dashboard API Server")
     parser.add_argument("--port", type=int, default=8080, help="Web Server Port")
@@ -1191,7 +1332,7 @@ def main():
     args = parser.parse_args()
     
     server_address = (args.host, args.port)
-    httpd = HTTPServer(server_address, DashboardHandler)
+    httpd = ReusableHTTPServer(server_address, DashboardHandler)
     
     print("\n" + "=" * 60)
     print(f"  MC-PILCO 扫参 Web 监控面板启动成功！")
@@ -1202,6 +1343,8 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n正在关闭 Web 服务...")
+    finally:
+        cleanup_background_task("server shutdown")
         httpd.server_close()
 
 

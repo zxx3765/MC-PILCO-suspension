@@ -1,6 +1,8 @@
 // MC-PILCO Web Dashboard Frontend Controller
 
 document.addEventListener("DOMContentLoaded", () => {
+    const UI_VERSION = "2026.06.09.1";
+
     // DOM Elements - Sweep Config Form
     const scriptSelect = document.getElementById("script-select");
     const seedInput = document.getElementById("seed-input");
@@ -23,6 +25,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const overallStatusBadge = document.getElementById("overall-status-badge");
     const overallStatusText = document.getElementById("overall-status-text");
     const elapsedTimeDisplay = document.getElementById("elapsed-time-display");
+    const dashboardVersionBadge = document.getElementById("dashboard-version-badge");
+    if (dashboardVersionBadge) {
+        dashboardVersionBadge.textContent = `UI v${UI_VERSION} / API loading / PID ?`;
+    }
     
     // DOM Elements - Progress Monitor
     const progressBar = document.getElementById("progress-bar-element");
@@ -375,6 +381,25 @@ document.addEventListener("DOMContentLoaded", () => {
         return "./results_tmp/quarter_car_gym";
     }
 
+    function getEvalCostSortValue(row) {
+        const cost = Number(row && row.eval_cost);
+        return Number.isFinite(cost) ? cost : Number.POSITIVE_INFINITY;
+    }
+
+    function sortByEvalCost(results) {
+        return [...(results || [])].sort((a, b) => getEvalCostSortValue(a) - getEvalCostSortValue(b));
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            "\"": "&quot;",
+            "'": "&#39;"
+        }[char]));
+    }
+
     // Load History & Render Leaderboard + Pareto Chart
     async function loadHistory() {
         const root = getActiveResultRoot();
@@ -382,8 +407,9 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch(`${API_BASE}/api/history?result_root=${encodeURIComponent(root)}&leaderboard=${encodeURIComponent(currentLeaderboard)}`);
             const data = await res.json();
             if (data.success) {
-                renderSavedLeaderboard(data.results);
-                updateChartData(data.results);
+                const rankedResults = sortByEvalCost(data.results);
+                renderSavedLeaderboard(rankedResults);
+                updateChartData(rankedResults);
             }
         } catch (err) {
             console.error("加载历史数据失败:", err);
@@ -399,11 +425,12 @@ document.addEventListener("DOMContentLoaded", () => {
             return;
         }
         
-        currentRunLeaderboardTbody.innerHTML = results.map((r, idx) => {
+        currentRunLeaderboardTbody.innerHTML = sortByEvalCost(results).map((r, idx) => {
+            const label = escapeHtml(r.label);
             return `
                 <tr>
                     <td>${idx + 1}</td>
-                    <td title="${r.label}">${r.label}</td>
+                    <td title="${label}">${label}</td>
                     <td>${r.lr}</td>
                     <td>${r.model_epochs}</td>
                     <td>${r.opt_steps}</td>
@@ -424,10 +451,13 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         
         savedLeaderboardTbody.innerHTML = results.map((r, idx) => {
+            const label = escapeHtml(r.label);
+            const entryId = escapeHtml(r.entry_id || "");
+            const rowIndex = r._row_index === undefined ? "" : escapeHtml(r._row_index);
             return `
                 <tr>
                     <td>${idx + 1}</td>
-                    <td title="${r.label}">${r.label}</td>
+                    <td title="${label}">${label}</td>
                     <td>${r.lr}</td>
                     <td>${r.model_epochs}</td>
                     <td>${r.opt_steps}</td>
@@ -435,7 +465,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     <td>${r.rms_tire ? Number(r.rms_tire).toFixed(4) : "-"}</td>
                     <td><strong>${r.eval_cost ? Number(r.eval_cost).toFixed(4) : "-"}</strong></td>
                     <td>
-                        <button class="delete-entry-btn btn-icon" data-label="${r.label}" title="从排行榜删除该项" style="color: var(--danger); padding: 4px 8px; font-size: 11px;">
+                        <button class="delete-entry-btn btn-icon" data-label="${label}" data-entry-id="${entryId}" data-row-index="${rowIndex}" title="从排行榜删除该项" style="color: var(--danger); padding: 4px 8px; font-size: 11px;">
                             <i class="fa-solid fa-trash"></i>
                         </button>
                     </td>
@@ -558,21 +588,29 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function deleteLeaderboardEntry(label) {
+    async function deleteLeaderboardEntry(label, entryId = "", rowIndex = "") {
         if (!confirm(`您确定要从排行榜中删除配置 "${label}" 吗？`)) {
             return;
         }
         
         const root = getActiveResultRoot();
+        const payload = {
+            result_root: root,
+            leaderboard: currentLeaderboard,
+            label: label
+        };
+        if (entryId) {
+            payload.entry_id = entryId;
+        }
+        if (rowIndex !== "") {
+            payload.row_index = rowIndex;
+        }
+
         try {
             const res = await fetch(`${API_BASE}/api/leaderboard/delete_entry`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    result_root: root,
-                    leaderboard: currentLeaderboard,
-                    label: label
-                })
+                body: JSON.stringify(payload)
             });
             const data = await handleResponse(res);
             if (data.success) {
@@ -624,7 +662,7 @@ document.addEventListener("DOMContentLoaded", () => {
             });
             const data = await handleResponse(res);
             if (data.success) {
-                alert(data.message || "当前运行结果已成功保存到持久排行榜！");
+                alert(data.message || "当前排行结果已成功添加到持久排行榜！");
                 
                 if (leaderboardSelect) {
                     leaderboardSelect.value = targetLb;
@@ -640,7 +678,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     lbTabBtn.click();
                 }
             } else {
-                alert(`保存失败: ${data.message}`);
+                alert(`添加失败: ${data.message}`);
             }
         } catch (err) {
             alert(`请求失败: ${err.message || err}`);
@@ -837,6 +875,12 @@ document.addEventListener("DOMContentLoaded", () => {
             overallStatusText.textContent = `系统空闲 (${state.status})`;
         }
         elapsedTimeDisplay.textContent = `已耗时: ${state.elapsed.toFixed(1)}s`;
+        if (dashboardVersionBadge) {
+            const apiVersion = state.dashboard_version || "old";
+            const pidText = state.server_pid ? `PID ${state.server_pid}` : "PID ?";
+            dashboardVersionBadge.textContent = `UI v${UI_VERSION} / API v${apiVersion} / ${pidText}`;
+            dashboardVersionBadge.title = `UI version: ${UI_VERSION}\nAPI version: ${apiVersion}\nStarted: ${state.server_started_at || "unknown"}\nWorkspace: ${state.workspace || "unknown"}`;
+        }
         
         // 2. 进度条
         const percent = state.total_configs > 0 ? (state.completed.length / state.total_configs) * 100 : 0;
@@ -1081,9 +1125,11 @@ document.addEventListener("DOMContentLoaded", () => {
     savedLeaderboardTbody.addEventListener("click", (e) => {
         const btn = e.target.closest(".delete-entry-btn");
         if (btn) {
-            const label = btn.getAttribute("data-label");
-            if (label) {
-                deleteLeaderboardEntry(label);
+            const label = btn.getAttribute("data-label") || "";
+            const entryId = btn.getAttribute("data-entry-id") || "";
+            const rowIndex = btn.getAttribute("data-row-index") || "";
+            if (label || entryId || rowIndex) {
+                deleteLeaderboardEntry(label, entryId, rowIndex);
             }
         }
     });
@@ -1101,11 +1147,19 @@ document.addEventListener("DOMContentLoaded", () => {
     fetch(`${API_BASE}/api/status`)
         .then(res => res.json())
         .then(state => {
+            syncUIState(state);
             if (state.running) {
                 startBtn.disabled = true;
                 singleStartBtn.disabled = true;
                 stopBtn.disabled = false;
                 startPolling();
+            }
+        })
+        .catch(err => {
+            console.error("Failed to load initial status:", err);
+            if (dashboardVersionBadge) {
+                dashboardVersionBadge.textContent = `UI v${UI_VERSION} / API unavailable / PID ?`;
+                dashboardVersionBadge.title = "Initial /api/status request failed. Make sure web_dashboard_server.py is running.";
             }
         });
 });

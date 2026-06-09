@@ -483,11 +483,11 @@
                             <h2>当前运行结果排行榜 (Current Run Leaderboard - Cost Ascending)</h2>
                         </div>
                         <div class="config-template-bar">
-                            <label for="current-run-save-target-select">保存至排行榜:</label>
+                            <label for="current-run-save-target-select">添加至排行榜:</label>
                             <select id="current-run-save-target-select" style="width: 140px;">
                                 <option value="default">默认 (default)</option>
                             </select>
-                            <button id="upload-current-btn" title="保存当次运行结果到选择的持久排行榜" class="btn-icon" style="background: var(--accent); border-color: var(--accent); color: white;" disabled><i class="fa-solid fa-cloud-arrow-up"></i> 保存当前结果</button>
+                            <button id="upload-current-btn" title="将当前运行排行榜结果添加到选择的持久排行榜" class="btn-icon" style="background: var(--accent); border-color: var(--accent); color: white;" disabled><i class="fa-solid fa-plus"></i> 添加当前排行结果</button>
                         </div>
                     </div>
                     <div class="card-body table-body">
@@ -723,7 +723,9 @@
         
         <!-- 底部 -->
         <footer class="app-footer">
-            <p>Copyright &copy; 2026 Mitsubishi Electric Research Laboratories (MERL) | SPDX-License-Identifier: AGPL-3.0-or-later</p>
+            <div class="version-badge" id="dashboard-version-badge" title="UI/API version and backend process">
+                UI version loading
+            </div>
         </footer>
         
     </div>
