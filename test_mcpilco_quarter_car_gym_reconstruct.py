@@ -83,6 +83,11 @@ p.add_argument("-validation_G0", type=float, default=None, help="Fixed validatio
 p.add_argument("-disable_validation_rollout", action="store_true", help="Disable fixed-road validation rollouts.")
 p.add_argument("-Road_Type", type=str, default="Random", choices=["Sine", "Chirp", "Random", "Bump"], help="Road type.")
 p.add_argument("-road_velocity", type=float, default=20.0, help="Road velocity parameter.")
+p.add_argument(
+    "-disable_road_gp_input",
+    action="store_true",
+    help="Disable road-aware GP inputs. By default GP uses [z_r, z_r_dot] from Gym info; policy still does not.",
+)
 p.add_argument("-as_max", type=float, default=1.0, help="Sprung acceleration safety limit.")
 p.add_argument("-deflec_max", type=float, default=0.04, help="Suspension deflection safety limit.")
 p.add_argument("-punish_Q_acc_s", type=float, default=10.0, help="Reward weight for sprung acceleration.")
@@ -113,6 +118,7 @@ p.add_argument(
 p.add_argument("-num_threads", type=int, default=4, help="Number of CPU threads for PyTorch")
 locals().update(vars(p.parse_known_args()[0]))
 
+use_road_gp_input = not disable_road_gp_input
 if validation_road_seed is None:
     validation_road_seed = road_seed + 1000000
 if validation_G0 is None:
@@ -123,6 +129,12 @@ def safe_path_name(value):
     value = str(value).strip()
     value = re.sub(r"[^0-9A-Za-z._-]+", "_", value)
     return value.strip("._-") or "run"
+
+
+def append_suffix_once(value, suffix):
+    if value.endswith(suffix):
+        return value
+    return value + suffix
 
 
 def compact_float(value):
@@ -209,7 +221,8 @@ print("\n---- 设置环境参数 ----")
 state_dim = 4  # Gym observation: [acc_s, vs, suspension_deflection, v_def] / obs_scaling
 input_dim = 1  # Gym action; physical force = action / act_scaling
 num_gp = state_dim  # Model every Gym observation delta directly
-gp_input_dim = state_dim + input_dim
+road_gp_input_dim = 2 if use_road_gp_input else 0
+gp_input_dim = state_dim + input_dim + road_gp_input_dim
 u_max = float(gym_env.action_space.high[0])  # Normalized Gym action limit
 std_list = std_noise * np.ones(state_dim)  # 所有状态维度的噪声
 fl_SOD_GP = True  # 是否在GP中使用数据子集(SOD)近似
@@ -223,6 +236,7 @@ model_learning_par["not_angle_indeces"] = [0, 1, 2, 3]
 model_learning_par["obs_scaling"] = env_config["obs_scaling"]
 model_learning_par["device"] = device
 model_learning_par["dtype"] = dtype
+model_learning_par["use_road_gp_input"] = use_road_gp_input
 if fl_SOD_GP:
     model_learning_par["approximation_mode"] = "SOD"
     model_learning_par["approximation_dict"] = {
@@ -309,7 +323,10 @@ print("\n---- 初始化 MC-PILCO-Gym ----")
 resolved_run_name = (
     safe_path_name(run_name) if run_name else build_run_name(env_config, control_policy_par, policy_optimization_dict)
 )
-log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name + "_reconstruct")
+if run_name is None and use_road_gp_input:
+    resolved_run_name = safe_path_name(resolved_run_name + "_roadgp")
+resolved_run_name = append_suffix_once(resolved_run_name, "_reconstruct")
+log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name)
 if os.path.isdir(log_path) and os.listdir(log_path) and not overwrite_existing:
     raise FileExistsError(
         "结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path)
@@ -318,7 +335,7 @@ os.makedirs(log_path, exist_ok=True)
 experiment_info = {
     "created_at": datetime.now().isoformat(timespec="seconds"),
     "seed": seed,
-    "run_name": resolved_run_name + "_reconstruct",
+    "run_name": resolved_run_name,
     "result_root": result_root,
     "log_path": log_path,
     "layout": "<result_root>/seed_<seed>/<run_name>/",
@@ -340,6 +357,8 @@ experiment_info = {
         "cost_l1": cost_l1,
         "cost_l2": cost_l2,
         "cost_l3": cost_l3,
+        "use_road_gp_input": use_road_gp_input,
+        "road_gp_input_dim": road_gp_input_dim,
         "enable_validation_rollout": not disable_validation_rollout,
         "validation_road_seed": validation_road_seed,
         "validation_G0": validation_G0,
@@ -387,6 +406,8 @@ MC_PILCO_init_dict["T_sampling"] = T_sampling
 MC_PILCO_init_dict["state_dim"] = state_dim
 MC_PILCO_init_dict["input_dim"] = input_dim
 MC_PILCO_init_dict["gym_env"] = str(type(gym_env))
+MC_PILCO_init_dict["use_road_gp_input"] = use_road_gp_input
+MC_PILCO_init_dict["road_gp_input_dim"] = road_gp_input_dim
 MC_PILCO_init_dict["enable_validation_rollout"] = not disable_validation_rollout
 MC_PILCO_init_dict["validation_road_seed"] = validation_road_seed
 MC_PILCO_init_dict["validation_G0"] = validation_G0

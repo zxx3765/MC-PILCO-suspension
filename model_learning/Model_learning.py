@@ -960,6 +960,7 @@ class Model_learning_Quarter_Car_Gym_State_Reconstruction(Model_learning_RBF_ang
         dtype=torch.float64,
         device=torch.device("cpu"),
         flg_norm=False,
+        use_road_gp_input=False,
     ):
         super(Model_learning_Quarter_Car_Gym_State_Reconstruction, self).__init__(
             num_gp=num_gp,
@@ -973,12 +974,13 @@ class Model_learning_Quarter_Car_Gym_State_Reconstruction(Model_learning_RBF_ang
             flg_norm=flg_norm,
         )
         self.obs_scaling = torch.tensor(obs_scaling, dtype=self.dtype, device=self.device)
+        self.use_exogenous_inputs = use_road_gp_input
 
     def to(self, device):
         super(Model_learning_Quarter_Car_Gym_State_Reconstruction, self).to(device)
         self.obs_scaling = self.obs_scaling.to(device)
 
-    def data_to_gp_input(self, states, inputs):
+    def data_to_gp_input(self, states, inputs, exogenous_inputs=None):
         """
         unscales observations and reconstructs physical wheel velocity:
         v_u = v_s - v_def
@@ -994,7 +996,12 @@ class Model_learning_Quarter_Car_Gym_State_Reconstruction(Model_learning_RBF_ang
         # Reconstruct physical coordinate state vector
         reconstructed_states = torch.cat([susp_def, v_def, v_s, v_u], dim=1)
         
-        return torch.cat([reconstructed_states, inputs], dim=1)
+        gp_in = torch.cat([reconstructed_states, inputs], dim=1)
+        if self.use_exogenous_inputs:
+            if exogenous_inputs is None:
+                raise ValueError("exogenous_inputs must be provided for road-aware GP model learning.")
+            gp_in = torch.cat([gp_in, exogenous_inputs], dim=1)
+        return gp_in
 
 
 class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_state):
@@ -1023,6 +1030,7 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         dtype=torch.float64,
         device=torch.device("cpu"),
         flg_norm=False,
+        use_road_gp_input=False,
     ):
         super(Model_learning_Quarter_Car_Gym_Physics_Residual, self).__init__(
             num_gp=num_gp,
@@ -1036,6 +1044,7 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
             flg_norm=flg_norm,
         )
         self.obs_scaling = torch.tensor(obs_scaling, dtype=self.dtype, device=self.device)
+        self.use_exogenous_inputs = use_road_gp_input
         self.act_scaling = act_scaling
         self.T_sampling = T_sampling
         self.m_s = m_s
@@ -1049,7 +1058,7 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         super(Model_learning_Quarter_Car_Gym_Physics_Residual, self).to(device)
         self.obs_scaling = self.obs_scaling.to(device)
 
-    def data_to_gp_input(self, states, inputs):
+    def data_to_gp_input(self, states, inputs, exogenous_inputs=None):
         """
         unscales observations and reconstructs physical wheel velocity:
         v_u = v_s - v_def
@@ -1060,7 +1069,12 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         v_def = unscaled_states[:, 3:4]
         v_u = v_s - v_def
         reconstructed_states = torch.cat([susp_def, v_def, v_s, v_u], dim=1)
-        return torch.cat([reconstructed_states, inputs], dim=1)
+        gp_in = torch.cat([reconstructed_states, inputs], dim=1)
+        if self.use_exogenous_inputs:
+            if exogenous_inputs is None:
+                raise ValueError("exogenous_inputs must be provided for road-aware GP model learning.")
+            gp_in = torch.cat([gp_in, exogenous_inputs], dim=1)
+        return gp_in
 
     def get_physics_delta_obs(self, states, inputs):
         """
@@ -1106,11 +1120,11 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         # Scale back to scaled observation space
         return delta_phys_unscaled / self.obs_scaling
 
-    def data_to_gp_IO(self, states, inputs):
+    def data_to_gp_IO(self, states, inputs, exogenous_inputs=None):
         """
         GP targets: observed scaled delta - nominal physics scaled delta
         """
-        gp_inputs = self.data_to_gp_input(states, inputs)[:-1, :]
+        gp_inputs = self.data_to_gp_input(states, inputs, exogenous_inputs=exogenous_inputs)[:-1, :]
         
         # Observed differences in scaled observation space
         observed_delta = states[1:] - states[:-1]
