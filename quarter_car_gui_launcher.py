@@ -33,14 +33,9 @@ CONFIG_DIR = os.path.join(WORKSPACE, "launcher_configs")
 
 
 TRAIN_MODES = {
-    "Road-aware GP": {
+    "Standard GP": {
         "script": TRAIN_SCRIPT,
         "extra_args": [],
-        "run_name_suffix": "_roadgp",
-    },
-    "Baseline": {
-        "script": TRAIN_SCRIPT,
-        "extra_args": ["-disable_road_gp_input"],
         "run_name_suffix": "",
     },
     "State Reconstruct": {
@@ -54,7 +49,7 @@ TRAIN_MODES = {
         "run_name_suffix": "_residual",
     },
 }
-DEFAULT_TRAIN_MODE = "Road-aware GP"
+DEFAULT_TRAIN_MODE = "Standard GP"
 
 
 TRAIN_CATEGORIES = {
@@ -101,6 +96,7 @@ TRAIN_CATEGORIES = {
         ("road_seed", "-road_seed", "827538"),
         ("Road_Type", "-Road_Type", "Random"),
         ("road_velocity", "-road_velocity", "20.0"),
+        ("use_road_gp_input (启用路面输入到GP)", "-use_road_gp_input", "True"),
     ],
     "代价函数惩罚权重 (Cost Weights)": [
         ("punish_Q_acc_s", "-punish_Q_acc_s", "10.0"),
@@ -261,7 +257,7 @@ class Launcher(tk.Tk):
                 elif label == "device":
                     combo = ttk.Combobox(lf, textvariable=var, values=["cpu", "cuda"], width=27, state="readonly")
                     combo.grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
-                elif "use_suspension_cost" in label:
+                elif "use_suspension_cost" in label or "use_road_gp_input" in label:
                     combo = ttk.Combobox(lf, textvariable=var, values=["False", "True"], width=27, state="readonly")
                     combo.grid(row=row, column=col + 1, sticky=tk.EW, pady=4)
                 else:
@@ -326,6 +322,8 @@ class Launcher(tk.Tk):
         overrides = overrides or {}
         args = []
         for label, flag, _default in field_defs:
+            if "use_road_gp_input" in label:
+                continue
             value = str(overrides[label] if label in overrides else var_map[label].get()).strip()
             if value:
                 if flag == "-use_suspension_cost":
@@ -584,7 +582,10 @@ class Launcher(tk.Tk):
 
     def effective_train_run_name(self):
         run_name = self._var_value(self.train_vars, "run_name").strip()
-        return self._append_suffix_once(run_name, self.current_train_mode_config()["run_name_suffix"])
+        suffix = self.current_train_mode_config()["run_name_suffix"]
+
+        # Training scripts add the road-GP marker only for auto-generated names.
+        return self._append_suffix_once(run_name, suffix)
 
     def save_config(self):
         suggested_name = self.config_name.get().strip() or self.train_vars["run_name"].get().strip()
@@ -620,6 +621,13 @@ class Launcher(tk.Tk):
         overrides = {"run_name": run_name} if run_name else {}
         command.extend(self._fields_to_args(TRAIN_FIELDS, self.train_vars, overrides=overrides))
         command.extend(mode_config["extra_args"])
+        
+        # Handle use_road_gp_input: if False/no/0, pass -disable_road_gp_input to the script
+        use_road = self.train_vars.get("use_road_gp_input (启用路面输入到GP)")
+        if use_road and use_road.get().lower() in ["false", "0", "no"]:
+            if "-disable_road_gp_input" not in command:
+                command.append("-disable_road_gp_input")
+                
         if self.overwrite_var.get():
             command.append("-overwrite_existing")
         self.is_training = self._run_command(command, on_success=self.on_train_success)

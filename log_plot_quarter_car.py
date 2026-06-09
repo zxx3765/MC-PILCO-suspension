@@ -42,12 +42,75 @@ def parse_args():
     return parser.parse_known_args()[0]
 
 
+def has_log_file(log_dir):
+    return os.path.isfile(os.path.join(log_dir, "log.pkl"))
+
+
+def unique_names(names):
+    unique = []
+    seen = set()
+    for name in names:
+        if name and name not in seen:
+            unique.append(name)
+            seen.add(name)
+    return unique
+
+
+def run_name_variants(run_name):
+    variants = [run_name]
+    variants.append(run_name.replace("_roadgp", ""))
+
+    for mode_suffix in ("_residual", "_reconstruct"):
+        road_after_mode = mode_suffix + "_roadgp"
+        road_before_mode = "_roadgp" + mode_suffix
+        if run_name.endswith(road_after_mode):
+            base = run_name[: -len(road_after_mode)]
+            variants.append(base + "_roadgp" + mode_suffix)
+            variants.append(base + mode_suffix)
+        if run_name.endswith(road_before_mode):
+            base = run_name[: -len(road_before_mode)]
+            variants.append(base + mode_suffix)
+
+    return unique_names(variants)
+
+
+def resolve_variant_log_dir(parent_dir, requested_name):
+    matches = []
+    for candidate_name in run_name_variants(requested_name):
+        candidate_dir = os.path.join(parent_dir, candidate_name)
+        if has_log_file(candidate_dir):
+            matches.append(candidate_dir)
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        names = ", ".join(os.path.basename(path) for path in matches)
+        raise ValueError("Multiple matching log folders found; use -log_dir: {}".format(names))
+    return None
+
+
 def resolve_log_dir(args):
     if args.log_dir is not None:
+        if has_log_file(args.log_dir):
+            return args.log_dir
+        parent_dir = os.path.dirname(os.path.normpath(args.log_dir))
+        requested_name = os.path.basename(os.path.normpath(args.log_dir))
+        resolved_log_dir = resolve_variant_log_dir(parent_dir, requested_name)
+        if resolved_log_dir is not None:
+            print("Warning: requested log_dir not found; using {}".format(resolved_log_dir))
+            return resolved_log_dir
         return args.log_dir
 
     if args.run_name is not None:
-        return os.path.join(args.result_root, "seed_" + str(args.seed), args.run_name)
+        grouped_seed_dir = os.path.join(args.result_root, "seed_" + str(args.seed))
+        requested_log_dir = os.path.join(grouped_seed_dir, args.run_name)
+        if has_log_file(requested_log_dir):
+            return requested_log_dir
+        resolved_log_dir = resolve_variant_log_dir(grouped_seed_dir, args.run_name)
+        if resolved_log_dir is not None:
+            print("Warning: requested run_name not found; using {}".format(resolved_log_dir))
+            return resolved_log_dir
+        return requested_log_dir
 
     legacy_log_dir = args.dir_path + "_" + str(args.seed)
     grouped_seed_dir = os.path.join(args.result_root, "seed_" + str(args.seed))

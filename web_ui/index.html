@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MC-PILCO 悬架强化学习控制台</title>
+    
+    <!-- 谷歌字体 & 字体图标 -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Chart.js 引入用于帕累托前沿和收敛曲线绘制 -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- 引入自定义样式 -->
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        
+        <!-- 头部标题栏 -->
+        <header class="app-header">
+            <div class="header-logo">
+                <i class="fa-solid fa-gauge-high"></i>
+                <div class="logo-text">
+                    <h1>MC-PILCO</h1>
+                    <span>Suspension RL sweep & launcher console</span>
+                </div>
+            </div>
+            
+            <!-- 标签页导航栏 -->
+            <nav class="header-tabs">
+                <button class="tab-btn active" data-tab="single-run"><i class="fa-solid fa-play"></i> 单次模型训练</button>
+                <button class="tab-btn" data-tab="sweep-run"><i class="fa-solid fa-circle-nodes"></i> 超参自动扫参</button>
+                <button class="tab-btn" data-tab="analysis-view"><i class="fa-solid fa-chart-line"></i> 实验结果分析</button>
+                <button class="tab-btn" data-tab="leaderboard-view"><i class="fa-solid fa-trophy"></i> 持久排行榜 & 帕累托图</button>
+            </nav>
+            
+            <div class="header-status">
+                <div class="status-indicator" id="overall-status-badge">
+                    <span class="pulse-dot"></span>
+                    <span id="overall-status-text">系统空闲</span>
+                </div>
+                <div class="header-timer">
+                    <i class="fa-regular fa-clock"></i>
+                    <span id="elapsed-time-display">已耗时: 0.0s</span>
+                </div>
+            </div>
+        </header>
+        
+        <!-- 主网格布局 -->
+        <main class="app-grid">
+            
+            <!-- ==========================================================================
+                 TAB 1: 单次模型训练 (Single Run)
+                 ========================================================================== -->
+            <section class="grid-card tab-content active" id="tab-single-run">
+                <div class="card-header config-header-actions">
+                    <div class="title-with-icon">
+                        <i class="fa-solid fa-sliders"></i>
+                        <h2>单次运行参数配置 (Form Parameters)</h2>
+                    </div>
+                    <!-- 配置模板快速管理 -->
+                    <div class="config-template-bar">
+                        <label for="config-template-select">配置模板:</label>
+                        <select id="config-template-select">
+                            <option value="">-- 新建配置 --</option>
+                        </select>
+                        <input type="text" id="config-template-name" placeholder="配置名称..." value="baseline">
+                        <button id="save-template-btn" title="保存当前配置" class="btn-icon"><i class="fa-solid fa-floppy-disk"></i></button>
+                        <button id="refresh-template-btn" title="刷新列表" class="btn-icon"><i class="fa-solid fa-rotate"></i></button>
+                    </div>
+                </div>
+                
+                <div class="card-body scrollable-body">
+                    <!-- 运行模式 -->
+                    <div class="input-row form-section-head">
+                        <div class="input-group">
+                            <label for="single-train-mode-select"><i class="fa-solid fa-layer-group"></i> 训练架构模式 (Model Architecture)</label>
+                            <select id="single-train-mode-select">
+                                <option value="Physics Residual" selected>物理模型残差模式 (Physics Residual)</option>
+                                <option value="State Reconstruct">状态重构模式 (State Reconstruct)</option>
+                                <option value="Standard GP">标准 GP 模式 (Standard GP)</option>
+                            </select>
+                        </div>
+                        <div class="input-group checkbox-group-row">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="single-overwrite-check" checked>
+                                允许覆盖同名实验目录 (-overwrite_existing)
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <!-- 手风琴可折叠配置组 -->
+                    <div class="accordion-container">
+                        
+                        <!-- 1. 基础与目录设置 (General) -->
+                        <div class="accordion-item">
+                            <div class="accordion-title">
+                                <span>1. 基础与目录设置 (General Settings)</span>
+                                <i class="fa-solid fa-chevron-down"></i>
+                            </div>
+                            <div class="accordion-content form-grid-3">
+                                <div class="input-group">
+                                    <label>随机种子 (seed)</label>
+                                    <input type="number" data-train-field="seed" value="1">
+                                </div>
+                                <div class="input-group">
+                                    <label>实验输出目录 (result_root)</label>
+                                    <input type="text" data-train-field="result_root" value="./results_tmp/quarter_car_gym">
+                                </div>
+                                <div class="input-group">
+                                    <label>实验命名名称 (run_name)</label>
+                                    <input type="text" data-train-field="run_name" value="baseline">
+                                </div>
+                                <div class="input-group">
+                                    <label>优化迭代 Trial 轮数</label>
+                                    <input type="number" data-train-field="num_trials" value="2">
+                                </div>
+                                <div class="input-group">
+                                    <label>计算设备 (device)</label>
+                                    <select data-train-field="device">
+                                        <option value="cpu">CPU</option>
+                                        <option value="cuda">cuda (GPU)</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label>计算线程数 (num_threads)</label>
+                                    <input type="number" data-train-field="num_threads" value="4">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 2. 强化学习与训练控制 (RL & Policy) -->
+                        <div class="accordion-item">
+                            <div class="accordion-title">
+                                <span>2. 强化学习与训练控制 (RL & Policy)</span>
+                                <i class="fa-solid fa-chevron-down"></i>
+                            </div>
+                            <div class="accordion-content form-grid-3">
+                                <div class="input-group">
+                                    <label>控制步长 [s] (T_sampling)</label>
+                                    <input type="text" data-train-field="T_sampling" value="0.01">
+                                </div>
+                                <div class="input-group">
+                                    <label>探索段时长 [s] (T_exploration)</label>
+                                    <input type="text" data-train-field="T_exploration" value="2.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>训练控制时长 [s] (T_control)</label>
+                                    <input type="text" data-train-field="T_control" value="2.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>测量噪声标准差 (std_noise)</label>
+                                    <input type="text" data-train-field="std_noise" value="0.001">
+                                </div>
+                                <div class="input-group">
+                                    <label>RBF 基函数个数 (num_basis)</label>
+                                    <input type="number" data-train-field="num_basis" value="50">
+                                </div>
+                                <div class="input-group">
+                                    <label>蒙特卡洛粒子数 (num_particles)</label>
+                                    <input type="number" data-train-field="num_particles" value="100">
+                                </div>
+                                <div class="input-group">
+                                    <label>策略每轮优化步数 (opt_steps)</label>
+                                    <input type="number" data-train-field="opt_steps" value="100">
+                                </div>
+                                <div class="input-group">
+                                    <label>策略学习率 lr</label>
+                                    <input type="text" data-train-field="lr" value="0.01">
+                                </div>
+                                <div class="input-group">
+                                    <label>策略随机丢弃率 Dropout</label>
+                                    <input type="text" data-train-field="p_dropout" value="0.05">
+                                </div>
+                                <div class="input-group">
+                                    <label>GP 优化迭代轮次 (model_epochs)</label>
+                                    <input type="number" data-train-field="model_epochs" value="2">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 3. Gym 环境与安全限制 (Gym & Safety) -->
+                        <div class="accordion-item">
+                            <div class="accordion-title">
+                                <span>3. Gym 环境与安全限制 (Gym & Safety)</span>
+                                <i class="fa-solid fa-chevron-down"></i>
+                            </div>
+                            <div class="accordion-content form-grid-3">
+                                <div class="input-group">
+                                    <label>最大仿真步长 (Max_step)</label>
+                                    <input type="number" data-train-field="Max_step" value="2000">
+                                </div>
+                                <div class="input-group">
+                                    <label>动作重复次数 (act_repeat)</label>
+                                    <input type="number" data-train-field="act_repeat" value="10">
+                                </div>
+                                <div class="input-group">
+                                    <label>动作物理缩放比例 (act_scaling)</label>
+                                    <input type="text" data-train-field="act_scaling" value="0.001">
+                                </div>
+                                <div class="input-group">
+                                    <label>奖励缩放比例 (rew_scaling)</label>
+                                    <input type="text" data-train-field="rew_scaling" value="0.2">
+                                </div>
+                                <div class="input-group">
+                                    <label>执行力幅值限制 [N] (act_max)</label>
+                                    <input type="text" data-train-field="act_max" value="1000.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>加速度安全范围 [g] (as_max)</label>
+                                    <input type="text" data-train-field="as_max" value="1.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>悬架限位最大位移 [m] (deflec_max)</label>
+                                    <input type="text" data-train-field="deflec_max" value="0.04">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 4. 悬架物理模型参数 (Suspension Dynamics) -->
+                        <div class="accordion-item">
+                            <div class="accordion-title">
+                                <span>4. 悬架物理模型参数 (Suspension Dynamics)</span>
+                                <i class="fa-solid fa-chevron-down"></i>
+                            </div>
+                            <div class="accordion-content form-grid-3">
+                                <div class="input-group">
+                                    <label>悬架刚度 Ks [N/m]</label>
+                                    <input type="text" data-train-field="Ks" value="20000.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>悬架阻尼 Cs [N·s/m]</label>
+                                    <input type="text" data-train-field="Cs" value="2000.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>车身簧上质量 Ms [kg]</label>
+                                    <input type="text" data-train-field="Ms" value="400.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>车轮簧下质量 Mu [kg]</label>
+                                    <input type="text" data-train-field="Mu" value="40.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>轮胎物理刚度 Kt [N/m]</label>
+                                    <input type="text" data-train-field="Kt" value="200000.0">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 5. 路面与输入激励 (Road Profile & Excitation) -->
+                        <div class="accordion-item">
+                            <div class="accordion-title">
+                                <span>5. 路面与输入激励 (Road Profile & Excitation)</span>
+                                <i class="fa-solid fa-chevron-down"></i>
+                            </div>
+                            <div class="accordion-content form-grid-3">
+                                <div class="input-group">
+                                    <label>评价路面不平度系数 G0</label>
+                                    <input type="text" data-train-field="G0" value="0.001024">
+                                </div>
+                                <div class="input-group">
+                                    <label>训练路面随机范围最小值 G0_min</label>
+                                    <input type="text" data-train-field="G0_min" value="0.000256">
+                                </div>
+                                <div class="input-group">
+                                    <label>训练路面随机范围最大值 G0_max</label>
+                                    <input type="text" data-train-field="G0_max" value="0.001024">
+                                </div>
+                                <div class="input-group">
+                                    <label>路面输入种子 (road_seed)</label>
+                                    <input type="number" data-train-field="road_seed" value="827538">
+                                </div>
+                                <div class="input-group">
+                                    <label>路面不平度类型 (Road_Type)</label>
+                                    <select data-train-field="Road_Type">
+                                        <option value="Random">随机路面 (Random)</option>
+                                        <option value="Sine">正弦路面 (Sine)</option>
+                                        <option value="Bump">脉冲路面 (Bump)</option>
+                                        <option value="Chirp">扫频激励 (Chirp)</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label>行车速度 [km/h] (road_velocity)</label>
+                                    <input type="text" data-train-field="road_velocity" value="20.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>GP 引入路面激励输入 (use_road_gp_input)</label>
+                                    <select data-train-field="use_road_gp_input (启用路面输入到GP)">
+                                        <option value="True">启用路面激励 (True)</option>
+                                        <option value="False">禁用路面激励 (False)</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 6. 代价函数惩罚权重 (Cost Weights) -->
+                        <div class="accordion-item">
+                            <div class="accordion-title">
+                                <span>6. 代价函数惩罚权重 (Cost Weights)</span>
+                                <i class="fa-solid fa-chevron-down"></i>
+                            </div>
+                            <div class="accordion-content form-grid-3">
+                                <div class="input-group">
+                                    <label>车身加速度惩罚 (punish_Q_acc_s)</label>
+                                    <input type="text" data-train-field="punish_Q_acc_s" value="10.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>悬架软阻位移边界 (punish_b_deflec)</label>
+                                    <input type="text" data-train-field="punish_b_deflec" value="0.025">
+                                </div>
+                                <div class="input-group">
+                                    <label>悬架动位移惩罚 (punish_Q_flec)</label>
+                                    <input type="text" data-train-field="punish_Q_flec" value="50.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>控制能耗力惩罚 (punish_Q_F)</label>
+                                    <input type="text" data-train-field="punish_Q_F" value="1.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>控制力变化率惩罚 (punish_Q_delta_F)</label>
+                                    <input type="text" data-train-field="punish_Q_delta_F" value="5.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>轮胎动变形惩罚 (punish_Q_flec_t)</label>
+                                    <input type="text" data-train-field="punish_Q_flec_t" value="1.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>高频簧上加速度惩罚 (punish_Q_acc_s_h)</label>
+                                    <input type="text" data-train-field="punish_Q_acc_s_h" value="2.5">
+                                </div>
+                                <div class="input-group">
+                                    <label>悬架阻碍超限惩罚 (punish_Q_b_defelc)</label>
+                                    <input type="text" data-train-field="punish_Q_b_defelc" value="-80.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>代价尺度: 簧上加速度 (cost_l0)</label>
+                                    <input type="text" data-train-field="cost_l0 (舒适性-车身加速度)" value="1.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>代价尺度: 簧上速度 (cost_l1)</label>
+                                    <input type="text" data-train-field="cost_l1 (车身速度)" value="0.1">
+                                </div>
+                                <div class="input-group">
+                                    <label>代价尺度: 悬架位移 (cost_l2)</label>
+                                    <input type="text" data-train-field="cost_l2 (动行程-悬架相对变形)" value="1.0">
+                                </div>
+                                <div class="input-group">
+                                    <label>代价尺度: 悬架变形速度 (cost_l3)</label>
+                                    <input type="text" data-train-field="cost_l3 (悬架相对变形速度)" value="1.0">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 7. 物理对齐综合代价 (Physics-Aligned Cost) -->
+                        <div class="accordion-item">
+                            <div class="accordion-title">
+                                <span>7. 物理对齐综合评价代价 (Physics-Aligned Cost)</span>
+                                <i class="fa-solid fa-chevron-down"></i>
+                            </div>
+                            <div class="accordion-content form-grid-3">
+                                <div class="input-group">
+                                    <label>启用综合代价函数 (use_suspension_cost)</label>
+                                    <select data-train-field="use_suspension_cost (启用综合评价代价)">
+                                        <option value="False">使用饱和饱和距离 (False)</option>
+                                        <option value="True">使用物理对齐代价 (True)</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label>舒适度权重 w_acc</label>
+                                    <input type="text" data-train-field="w_acc (舒适性权重)" value="0.4">
+                                </div>
+                                <div class="input-group">
+                                    <label>路面接地安全权重 w_tire</label>
+                                    <input type="text" data-train-field="w_tire (接地性权重)" value="0.4">
+                                </div>
+                                <div class="input-group">
+                                    <label>行程限位安全惩罚权重 w_barrier</label>
+                                    <input type="text" data-train-field="w_barrier (行程限位安全权重)" value="0.2">
+                                </div>
+                                <div class="input-group">
+                                    <label>簧上加速度规范尺度 (l_acc)</label>
+                                    <input type="text" data-train-field="l_acc (舒适性加速度尺度 m/s^2)" value="1.5">
+                                </div>
+                                <div class="input-group">
+                                    <label>轮胎相对动位移规范尺度 (l_tire)</label>
+                                    <input type="text" data-train-field="l_tire (动变形尺度 m)" value="0.006">
+                                </div>
+                                <div class="input-group">
+                                    <label>安全位移阻碍阈值 [m] (d_barrier)</label>
+                                    <input type="text" data-train-field="d_barrier (安全屏障起始点 m)" value="0.035">
+                                </div>
+                                <div class="input-group">
+                                    <label>安全位移阻碍壁陡度 (beta_barrier)</label>
+                                    <input type="text" data-train-field="beta_barrier (安全屏障陡度)" value="150.0">
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+                    
+                    <div class="action-buttons-fixed">
+                        <button id="single-start-btn" class="btn btn-primary"><i class="fa-solid fa-play"></i> 启动单次物理训练</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ==========================================================================
+                 TAB 2: 超参自动扫参 (Sweep Run)
+                 ========================================================================== -->
+            <section class="tab-content" id="tab-sweep-run" style="flex-direction: column; gap: 20px; width: 100%;">
+                <div class="grid-card" style="width: 100%;">
+                    <div class="card-header">
+                        <i class="fa-solid fa-circle-nodes"></i>
+                        <h2>超参数扫参计划 (Sweep Optimizations)</h2>
+                    </div>
+                    <div class="card-body">
+                        <div class="input-group">
+                            <label for="script-select"><i class="fa-solid fa-file-code"></i> 目标训练模型</label>
+                            <select id="script-select">
+                                <option value="test_mcpilco_quarter_car_gym_residual.py" selected>物理模型残差模式 (Physics Residual)</option>
+                                <option value="test_mcpilco_quarter_car_gym_reconstruct.py">状态重构模式 (State Reconstruct)</option>
+                                <option value="test_mcpilco_quarter_car_gym.py">标准 GP 模式 (Standard GP)</option>
+                            </select>
+                        </div>
+                        
+                        <div class="input-row">
+                            <div class="input-group">
+                                <label for="seed-input"><i class="fa-solid fa-seedling"></i> 随机种子</label>
+                                <input type="number" id="seed-input" value="1" min="1">
+                            </div>
+                            <div class="input-group">
+                                <label for="device-select"><i class="fa-solid fa-microchip"></i> 计算设备</label>
+                                <select id="device-select">
+                                    <option value="cpu" selected>CPU</option>
+                                    <option value="cuda">GPU (CUDA)</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="input-row">
+                            <div class="input-group">
+                                <label for="trials-input"><i class="fa-solid fa-repeat"></i> 优化迭代轮次 (Trials)</label>
+                                <input type="number" id="trials-input" value="2" min="1">
+                            </div>
+                            <div class="input-group">
+                                <label for="sweep-select"><i class="fa-solid fa-magnifying-glass-chart"></i> 扫参模式</label>
+                                <select id="sweep-select">
+                                    <option value="quick" selected>快速组合 (Quick)</option>
+                                    <option value="grid">网格搜索 (Grid)</option>
+                                    <option value="custom">自定义组合 (Custom)</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="input-group custom-json-group" id="custom-json-container" style="display: none;">
+                            <label for="custom-configs-input"><i class="fa-solid fa-code"></i> 自定义超参列表 (JSON List)</label>
+                            <textarea id="custom-configs-input" placeholder='[
+  {"lr": [0.01, 0.005], "model_epochs": 2, "opt_steps": [2, 5]}
+]'>[
+  {
+    "lr": [0.01, 0.005],
+    "model_epochs": [2, 4],
+    "opt_steps": [100, 150]
+  }
+]</textarea>
+                        </div>
+                        
+                        <div class="action-buttons">
+                            <button id="start-btn" class="btn btn-primary"><i class="fa-solid fa-play"></i> 启动超参数扫参</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 当前运行结果的排行榜 (Current Run Leaderboard) -->
+                <div class="grid-card leaderboard-panel" style="max-height: 520px; width: 100%;">
+                    <div class="card-header config-header-actions">
+                        <div class="title-with-icon">
+                            <i class="fa-solid fa-play"></i>
+                            <h2>当前运行结果排行榜 (Current Run Leaderboard - Cost Ascending)</h2>
+                        </div>
+                        <div class="config-template-bar">
+                            <label for="current-run-save-target-select">保存至排行榜:</label>
+                            <select id="current-run-save-target-select" style="width: 140px;">
+                                <option value="default">默认 (default)</option>
+                            </select>
+                            <button id="upload-current-btn" title="保存当次运行结果到选择的持久排行榜" class="btn-icon" style="background: var(--accent); border-color: var(--accent); color: white;" disabled><i class="fa-solid fa-cloud-arrow-up"></i> 保存当前结果</button>
+                        </div>
+                    </div>
+                    <div class="card-body table-body">
+                        <div class="table-responsive">
+                            <table class="leaderboard-table">
+                                <thead>
+                                    <tr>
+                                        <th>排名</th>
+                                        <th>配置标签</th>
+                                        <th>学习率 lr</th>
+                                        <th>GP Epochs</th>
+                                        <th>Opt Steps</th>
+                                        <th>簧上加速度 RMS</th>
+                                        <th>轮胎动变形 RMS</th>
+                                        <th>最终Cost</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="current-run-leaderboard-tbody">
+                                    <tr>
+                                        <td colspan="8" class="table-empty">暂无评估完的数据</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- ==========================================================================
+                 TAB 3: 实验结果分析 (Analysis View)
+                 ========================================================================== -->
+            <section class="grid-card tab-content" id="tab-analysis-view">
+                <div class="card-header">
+                    <i class="fa-solid fa-chart-area"></i>
+                    <h2>物理分析绘图查看器 (Plot Gallery)</h2>
+                </div>
+                <div class="card-body scrollable-body">
+                    <!-- 选择已有的实验目录 -->
+                    <div class="input-row">
+                        <div class="input-group">
+                            <label><i class="fa-solid fa-folder-open"></i> 选择实验名称</label>
+                            <select id="analysis-run-select">
+                                <option value="">-- 请选择实验 --</option>
+                            </select>
+                        </div>
+                        <div class="input-group">
+                            <label><i class="fa-solid fa-seedling"></i> 随机种子</label>
+                            <input type="number" id="analysis-seed-input" value="1">
+                        </div>
+                        <div class="input-group">
+                            <label><i class="fa-solid fa-folder"></i> 结果根目录</label>
+                            <input type="text" id="analysis-root-input" value="./results_tmp/quarter_car_gym">
+                        </div>
+                    </div>
+                    
+                    <div class="action-buttons-row" style="display: flex; gap: 10px;">
+                        <button id="load-plots-btn" class="btn btn-primary"><i class="fa-solid fa-cloud-arrow-down"></i> 加载物理曲线图</button>
+                        <button id="upload-past-btn" class="btn btn-primary" style="background: linear-gradient(135deg, var(--accent), #00796b); box-shadow: 0 4px 12px var(--accent-glow);"><i class="fa-solid fa-trophy"></i> 上传该实验至排行榜</button>
+                    </div>
+                    <div id="analysis-runs-status" class="helper-text"></div>
+
+                    <!-- 实验波形图片画廊 -->
+                    <div class="plots-gallery-container" id="plots-gallery" style="display: none;">
+                        <div class="gallery-selector-buttons" id="gallery-tabs">
+                            <!-- JS 动态生成图片标签切换 -->
+                        </div>
+                        
+                        <div class="gallery-image-box">
+                            <img id="gallery-display-image" src="" alt="物理曲线">
+                            <div class="gallery-caption" id="gallery-display-caption">无图片</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 右侧实时监控与面板 -->
+            <section class="grid-card progress-panel">
+                <div class="card-header">
+                    <i class="fa-solid fa-chart-line"></i>
+                    <h2>实时状态监控 (Live Monitor)</h2>
+                </div>
+                <div class="card-body">
+                    
+                    <!-- 总体进度条 -->
+                    <div class="progress-section">
+                        <div class="progress-labels">
+                            <span class="progress-title">运行任务完成进度</span>
+                            <span class="progress-percentage" id="progress-percent-text">0%</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="progress-bar-element" style="width: 0%;"></div>
+                        </div>
+                        <div class="progress-stats">
+                            <span id="progress-ratio-text">完成度: 0 / 0</span>
+                            <span id="estimated-remaining-text">剩余时间: 估算中...</span>
+                        </div>
+                    </div>
+                    
+                    <!-- 当前执行细节 -->
+                    <div class="details-section">
+                        <h3>当前计算细节</h3>
+                        <div class="details-grid">
+                            <div class="detail-item">
+                                <span class="detail-label">运行标签</span>
+                                <span class="detail-value" id="current-label-val">-</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">状态</span>
+                                <span class="detail-value highlight" id="current-status-val">等待启动</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">学习率 (lr)</span>
+                                <span class="detail-value" id="current-lr-val">-</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">GP Epochs</span>
+                                <span class="detail-value" id="current-epochs-val">-</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">Opt Steps</span>
+                                <span class="detail-value" id="current-steps-val">-</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">优化进展</span>
+                                <span class="detail-value" id="current-step-val">-</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">当前Cost</span>
+                                <span class="detail-value" id="current-cost-val">-</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">当前轮次 (Trial)</span>
+                                <span class="detail-value" id="current-trial-val">-</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Dynamics GP MSE 误差 -->
+                    <div class="gp-errors-section">
+                        <h3>Dynamics GP 拟合误差 (MSE)</h3>
+                        <div class="gp-grid" id="gp-errors-list">
+                            <div class="gp-empty">等待 GP 拟合数据...</div>
+                        </div>
+                    </div>
+                    
+                    <div class="control-actions-panel">
+                        <button id="stop-btn" class="btn btn-danger" disabled><i class="fa-solid fa-stop"></i> 强行停止当前计算任务</button>
+                    </div>
+                    
+                </div>
+            </section>
+            
+            <!-- 实时控制台终端日志 -->
+            <section class="grid-card console-panel full-width">
+                <div class="card-header">
+                    <i class="fa-solid fa-terminal"></i>
+                    <h2>控制台标准输出日志 (Terminal Output Stream)</h2>
+                    <div class="console-actions">
+                        <button id="clear-console-btn" title="清空历史"><i class="fa-solid fa-trash-can"></i></button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="console-box" id="console-output-box">
+                        <div class="console-line system-msg">[SYSTEM] 等待实验启动，终端实时日志将在此流式打印...</div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- ==========================================================================
+                 TAB 4: 超参排行榜与帕累托前沿 (Leaderboard & Pareto View)
+                 ========================================================================== -->
+            <section class="tab-content" id="tab-leaderboard-view" style="grid-column: span 2; flex-direction: column; gap: 20px; width: 100%;">
+                <div style="display: grid; grid-template-columns: 1.1fr 1.3fr; gap: 20px; width: 100%;">
+                    
+                    <!-- 数据图表帕累托前沿 -->
+                    <section class="grid-card chart-panel" style="max-height: 520px; width: 100%;">
+                        <div class="card-header">
+                            <i class="fa-solid fa-chart-scatter"></i>
+                            <h2>悬架性能帕累托前沿 (Comfort vs Safety)</h2>
+                        </div>
+                        <div class="card-body chart-body">
+                            <canvas id="pareto-chart-canvas"></canvas>
+                        </div>
+                    </section>
+                    
+                    <!-- 参数排行榜表格 -->
+                    <section class="grid-card leaderboard-panel" style="max-height: 520px; width: 100%;">
+                        <div class="card-header config-header-actions">
+                            <div class="title-with-icon">
+                                <i class="fa-solid fa-trophy"></i>
+                                <h2>持久排行榜 (Persistent Leaderboard - Cost Ascending)</h2>
+                            </div>
+                            <!-- 排行榜快速切换与管理 -->
+                            <div class="config-template-bar">
+                                <label for="leaderboard-select">排行榜:</label>
+                                <select id="leaderboard-select">
+                                    <option value="default">默认 (default)</option>
+                                </select>
+                                <input type="text" id="new-leaderboard-name" placeholder="新排行榜名称..." style="width: 130px;">
+                                <button id="save-leaderboard-btn" title="另存当前排行榜" class="btn-icon"><i class="fa-solid fa-floppy-disk"></i> 另存为</button>
+                                <button id="delete-leaderboard-btn" title="删除当前排行榜" class="btn-icon" style="color: var(--danger);"><i class="fa-solid fa-trash-can"></i> 删除</button>
+                            </div>
+                        </div>
+                        <div class="card-body table-body">
+                            <div class="table-responsive">
+                                <table class="leaderboard-table">
+                                    <thead>
+                                        <tr>
+                                            <th>排名</th>
+                                            <th>配置标签</th>
+                                            <th>学习率 lr</th>
+                                            <th>GP Epochs</th>
+                                            <th>Opt Steps</th>
+                                            <th>簧上加速度 RMS</th>
+                                            <th>轮胎动变形 RMS</th>
+                                            <th>最终Cost</th>
+                                            <th>操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="saved-leaderboard-tbody">
+                                        <tr>
+                                            <td colspan="9" class="table-empty">暂无评估完的数据</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+                    
+                </div>
+            </section>
+        </main>
+        
+        <!-- 底部 -->
+        <footer class="app-footer">
+            <p>Copyright &copy; 2026 Mitsubishi Electric Research Laboratories (MERL) | SPDX-License-Identifier: AGPL-3.0-or-later</p>
+        </footer>
+        
+    </div>
+    
+    <!-- 引入前端控制器逻辑 -->
+    <script src="app.js"></script>
+</body>
+</html>
