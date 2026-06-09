@@ -169,11 +169,13 @@ class Dashboard:
             print()
 
 
-def run_experiment(script_path, run_name, args_dict, db):
+def run_experiment(script_path, run_name, args_dict, db, unknown_args=None):
     """运行训练子进程并解析其实时状态以更新面板"""
     cmd = [sys.executable, "-u", script_path, "-run_name", run_name]
     for k, v in args_dict.items():
         cmd.extend([f"-{k}", str(v)])
+    if unknown_args:
+        cmd.extend(unknown_args)
     cmd.append("-overwrite_existing")
     
     db.current_status = "启动中"
@@ -340,7 +342,7 @@ def main():
     parser.add_argument("-custom_configs", type=str, default=None, help="JSON list of custom configuration dicts.")
     parser.add_argument("-no_tui", action="store_true", help="Disable clearing screen and printing interactive TUI dashboard.")
     
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
     
     # 构造扫参列表
     if args.sweep_mode == "quick":
@@ -438,9 +440,12 @@ def main():
             "lr": lr,
             "device": args.device
         }
+        for k, v in cfg.items():
+            if k not in ["label", "lr", "model_epochs", "opt_steps", "num_trials"]:
+                train_args[k] = v
         
         # 运行训练脚本并同步更新 TUI
-        success = run_experiment(args.script, run_name_base, train_args, db)
+        success = run_experiment(args.script, run_name_base, train_args, db, unknown_args)
         
         if success:
             script_suffix = ""

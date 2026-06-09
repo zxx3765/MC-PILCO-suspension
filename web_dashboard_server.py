@@ -114,6 +114,7 @@ sweep_status = {
     "num_trials": 0,
     "status": "空闲",
     "trial_str": "",
+    "current_trial": 0,
     "opt_step": 0,
     "opt_cost": 0.0,
     "gp_errors": {},
@@ -454,6 +455,7 @@ def run_single_thread(cmd, script_name, params):
     sweep_status["opt_steps"] = int(train_dict.get("opt_steps", 100))
     sweep_status["num_trials"] = int(train_dict.get("num_trials", 2))
     sweep_status["trial_str"] = ""
+    sweep_status["current_trial"] = 0
     sweep_status["opt_step"] = 0
     sweep_status["opt_cost"] = 0.0
     sweep_status["gp_errors"] = {}
@@ -476,6 +478,7 @@ def run_single_thread(cmd, script_name, params):
         with sweep_process_lock:
             sweep_process = process
         
+        captured_log_path = None
         assert process.stdout is not None
         for line in process.stdout:
             line_strip = line.strip()
@@ -486,17 +489,28 @@ def run_single_thread(cmd, script_name, params):
             if len(console_logs) > 60:
                 console_logs.pop(0)
                 
+            if "结果已保存至:" in line_strip:
+                try:
+                    captured_log_path = line_strip.split("结果已保存至:", 1)[1].strip()
+                except Exception:
+                    pass
+                
             # 实时进度条与状态字段映射
             if "EXPLORATION #" in line_strip:
                 sweep_status["status"] = "随机探索数据收集"
                 sweep_status["trial_str"] = ""
-            elif "TRIAL" in line_strip:
-                parts = line_strip.split()
-                for p in parts:
-                    if p.isdigit():
-                        sweep_status["trial_str"] = f"(Trial {p})"
-                        break
-            elif "REINFORCE THE MODEL" in line_strip or "REINFORCE THE SYSTEM" in line_strip:
+                sweep_status["current_trial"] = 0
+                sweep_status["opt_step"] = 0
+            
+            # Match Trial
+            match_trial = re.search(r"TRIAL\s*(\d+)", line_strip, re.IGNORECASE)
+            if match_trial:
+                trial_num = int(match_trial.group(1))
+                sweep_status["current_trial"] = trial_num
+                sweep_status["trial_str"] = f"(Trial {trial_num})"
+                sweep_status["opt_step"] = 0  # 开启新 trial 时重置优化步骤
+
+            if "REINFORCE THE MODEL" in line_strip or "REINFORCE THE SYSTEM" in line_strip:
                 sweep_status["status"] = "GP动力学模型拟合"
             elif "REINFORCE THE POLICY" in line_strip:
                 sweep_status["status"] = "控制策略更新"
@@ -511,14 +525,20 @@ def run_single_thread(cmd, script_name, params):
                     except ValueError:
                         mse_val_fmt = mse_val
                     sweep_status["gp_errors"][gp_name] = mse_val_fmt
-            elif "Optimization step:" in line_strip:
+            
+            # Match optimization step
+            match_step = re.search(r"Optimization step:\s*(\d+)", line_strip, re.IGNORECASE)
+            if match_step:
                 try:
-                    sweep_status["opt_step"] = int(line_strip.split(":")[-1].strip())
+                    sweep_status["opt_step"] = int(match_step.group(1))
                 except ValueError:
                     pass
-            elif "cost:" in line_strip:
+            
+            # Match cost
+            match_cost = re.search(r"cost:\s*([\d\.\-]+)", line_strip, re.IGNORECASE)
+            if match_cost:
                 try:
-                    sweep_status["opt_cost"] = float(line_strip.split(":")[-1].strip())
+                    sweep_status["opt_cost"] = float(match_cost.group(1))
                 except ValueError:
                     pass
             
@@ -531,7 +551,32 @@ def run_single_thread(cmd, script_name, params):
             sweep_status["status"] = "物理评估"
             result_root = train_dict.get("result_root", "./results_tmp/quarter_car_gym")
             seed = train_dict.get("seed", 1)
-            actual_result_dir = resolve_run_dir(result_root, seed, run_name_full)
+            
+            # Resolve actual_result_dir with dynamic captured log path
+            actual_result_dir = None
+            if captured_log_path:
+                if os.path.isabs(captured_log_path):
+                    actual_result_dir = os.path.normpath(captured_log_path)
+                else:
+                    actual_result_dir = os.path.normpath(os.path.join(WORKSPACE, captured_log_path))
+            
+            # Wait up to 2 seconds for log.pkl to be flushed and visible
+            if actual_result_dir:
+                log_file_path = os.path.join(actual_result_dir, "log.pkl")
+                for _ in range(10):
+                    if os.path.isfile(log_file_path):
+                        break
+                    time.sleep(0.2)
+            
+            # Fallback to resolve_run_dir if path is not found or log is missing
+            if not actual_result_dir or not os.path.isfile(os.path.join(actual_result_dir, "log.pkl")):
+                actual_result_dir = resolve_run_dir(result_root, seed, run_name_full)
+                log_file_path = os.path.join(actual_result_dir, "log.pkl")
+                for _ in range(10):
+                    if os.path.isfile(log_file_path):
+                        break
+                    time.sleep(0.2)
+                    
             actual_run_name = os.path.basename(os.path.normpath(actual_result_dir))
             if actual_run_name != run_name_full:
                 console_logs.append(f"[Plotting] resolved run folder: {actual_run_name}")
@@ -623,6 +668,7 @@ def run_name_variants(run_name):
     variants = [run_name]
     variants.append(run_name.replace("_roadgp", ""))
 
+    # Strip existing suffixes
     for mode_suffix in ("_residual", "_reconstruct"):
         road_after_mode = mode_suffix + "_roadgp"
         road_before_mode = "_roadgp" + mode_suffix
@@ -630,9 +676,26 @@ def run_name_variants(run_name):
             base = run_name[: -len(road_after_mode)]
             variants.append(base + "_roadgp" + mode_suffix)
             variants.append(base + mode_suffix)
-        if run_name.endswith(road_before_mode):
+            variants.append(base)
+        elif run_name.endswith(road_before_mode):
             base = run_name[: -len(road_before_mode)]
             variants.append(base + mode_suffix)
+            variants.append(base)
+        elif run_name.endswith(mode_suffix):
+            base = run_name[: -len(mode_suffix)]
+            variants.append(base)
+
+    # Add suffixes if not present
+    for mode_suffix in ("_residual", "_reconstruct"):
+        if not run_name.endswith(mode_suffix):
+            variants.append(run_name + mode_suffix)
+            if run_name.endswith("_roadgp"):
+                base = run_name[:-7]
+                variants.append(base + mode_suffix + "_roadgp")
+                variants.append(base + "_roadgp" + mode_suffix)
+            else:
+                variants.append(run_name + "_roadgp" + mode_suffix)
+                variants.append(run_name + mode_suffix + "_roadgp")
 
     return unique_names(variants)
 
@@ -992,6 +1055,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             ]
             if sweep_mode == "custom" and custom_configs:
                 cmd.extend(["-custom_configs", custom_configs])
+
+            # 提取额外的训练/代价/物理参数并附加为命令行参数
+            exclude_keys = {"script", "seed", "device", "sweep_mode", "num_trials", "custom_configs", "conda_env", "result_root", "run_name"}
+            for k, v in params.items():
+                if k not in exclude_keys:
+                    # 查找对应字段的 flag
+                    flag = None
+                    for spec_label, spec_flag in TRAIN_FIELDS_SPEC:
+                        if spec_label == k:
+                            flag = spec_flag
+                            break
+                    if flag:
+                        v_str = str(v).strip()
+                        if v_str:
+                            if flag == "-use_suspension_cost":
+                                if v_str.lower() in ["true", "1", "yes"]:
+                                    cmd.append(flag)
+                            elif flag == "-use_road_gp_input":
+                                if v_str.lower() in ["false", "0", "no"]:
+                                    cmd.append("-disable_road_gp_input")
+                            else:
+                                cmd.extend([flag, v_str])
                 
             sweep_thread = threading.Thread(target=run_sweep_thread, args=(cmd,), daemon=True)
             sweep_thread.start()

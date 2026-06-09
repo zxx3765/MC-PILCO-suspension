@@ -769,13 +769,17 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         }
         
+        const formConfig = getFormConfig();
+        const trainParams = formConfig.train || {};
+
         const config = {
             script: scriptSelect.value,
             seed: parseInt(seedInput.value) || 1,
             device: deviceSelect.value,
             sweep_mode: sweepSelect.value,
             num_trials: parseInt(trialsInput.value) || 2,
-            custom_configs: customConfigs
+            custom_configs: customConfigs,
+            ...trainParams
         };
 
         startBtn.disabled = true;
@@ -830,6 +834,23 @@ document.addEventListener("DOMContentLoaded", () => {
     // ==========================================================================
     // Polling Loop & State Sync
     // ==========================================================================
+    function formatDuration(seconds) {
+        if (seconds === null || seconds === undefined || seconds < 0 || isNaN(seconds)) {
+            return "--";
+        }
+        const totalSecs = Math.round(seconds);
+        const hours = Math.floor(totalSecs / 3600);
+        const minutes = Math.floor((totalSecs % 3600) / 60);
+        const secs = totalSecs % 60;
+        
+        const pad = (num) => String(num).padStart(2, "0");
+        if (hours > 0) {
+            return `${pad(hours)}:${pad(minutes)}:${pad(secs)}`;
+        } else {
+            return `${pad(minutes)}:${pad(secs)}`;
+        }
+    }
+
     function startPolling() {
         if (isMonitoring) return;
         isMonitoring = true;
@@ -883,21 +904,65 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         
         // 2. 进度条
-        const percent = state.total_configs > 0 ? (state.completed.length / state.total_configs) * 100 : 0;
+        let percent = 0;
+        if (state.total_configs > 0) {
+            if (state.total_configs === 1) {
+                if (state.status === "已结束") {
+                    percent = 100;
+                } else if (!state.running) {
+                    percent = 0;
+                } else {
+                    const total_trials = state.num_trials > 0 ? state.num_trials : 2;
+                    const trial_num = state.current_trial !== undefined ? state.current_trial : 0;
+                    const total_steps = state.opt_steps > 0 ? state.opt_steps : 100;
+                    const step_num = state.opt_step !== undefined ? state.opt_step : 0;
+
+                    const base_pct = (trial_num / total_trials) * 100;
+                    const step_pct = total_steps > 0 ? (step_num / total_steps) * (100 / total_trials) : 0;
+                    percent = base_pct + step_pct;
+                    percent = Math.min(Math.max(percent, 0), 99.9);
+                }
+            } else {
+                percent = (state.completed.length / state.total_configs) * 100;
+            }
+        }
         progressBar.style.width = `${percent}%`;
         progressPercentText.textContent = `${percent.toFixed(0)}%`;
-        progressRatioText.textContent = `完成组数: ${state.completed.length} / ${state.total_configs}`;
+        
+        if (state.total_configs === 1) {
+            const total_trials = state.num_trials > 0 ? state.num_trials : 2;
+            const trial_num = state.current_trial !== undefined ? state.current_trial : 0;
+            const total_steps = state.opt_steps > 0 ? state.opt_steps : 100;
+            const step_num = state.opt_step !== undefined ? state.opt_step : 0;
+            progressRatioText.textContent = `当前进度: Trial ${trial_num + 1} / ${total_trials} | Step ${step_num} / ${total_steps}`;
+        } else {
+            progressRatioText.textContent = `完成组数: ${state.completed.length} / ${state.total_configs}`;
+        }
         
         // 估算剩余时间
-        if (state.completed.length > 0 && state.running) {
-            const avgTime = state.elapsed / state.completed.length;
-            const remainingTime = avgTime * (state.total_configs - state.completed.length);
-            estRemainingText.textContent = `预计剩余: ${remainingTime.toFixed(1)}s`;
-        } else if (state.running) {
-            estRemainingText.textContent = `预计剩余: 估算中...`;
+        let remainingTimeText = "预计剩余: -";
+        if (state.running) {
+            if (state.total_configs === 1) {
+                const pct = percent / 100.0;
+                if (pct > 0.01) {
+                    const remainingTime = state.elapsed / pct - state.elapsed;
+                    remainingTimeText = `预计剩余: ${formatDuration(remainingTime)}`;
+                } else {
+                    remainingTimeText = `预计剩余: 估算中...`;
+                }
+            } else {
+                if (state.completed.length > 0) {
+                    const avgTime = state.elapsed / state.completed.length;
+                    const remainingTime = avgTime * (state.total_configs - state.completed.length);
+                    remainingTimeText = `预计剩余: ${formatDuration(remainingTime)}`;
+                } else {
+                    remainingTimeText = `预计剩余: 估算中...`;
+                }
+            }
         } else {
-            estRemainingText.textContent = `预计剩余: -`;
+            remainingTimeText = `预计剩余: -`;
         }
+        estRemainingText.textContent = remainingTimeText;
         
         // 3. 当前超参详情
         currentLabelVal.textContent = state.label || "-";

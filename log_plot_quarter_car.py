@@ -57,9 +57,11 @@ def unique_names(names):
 
 
 def run_name_variants(run_name):
+    run_name = str(run_name or "").strip()
     variants = [run_name]
     variants.append(run_name.replace("_roadgp", ""))
 
+    # Strip existing suffixes
     for mode_suffix in ("_residual", "_reconstruct"):
         road_after_mode = mode_suffix + "_roadgp"
         road_before_mode = "_roadgp" + mode_suffix
@@ -67,11 +69,29 @@ def run_name_variants(run_name):
             base = run_name[: -len(road_after_mode)]
             variants.append(base + "_roadgp" + mode_suffix)
             variants.append(base + mode_suffix)
-        if run_name.endswith(road_before_mode):
+            variants.append(base)
+        elif run_name.endswith(road_before_mode):
             base = run_name[: -len(road_before_mode)]
             variants.append(base + mode_suffix)
+            variants.append(base)
+        elif run_name.endswith(mode_suffix):
+            base = run_name[: -len(mode_suffix)]
+            variants.append(base)
+
+    # Add suffixes if not present
+    for mode_suffix in ("_residual", "_reconstruct"):
+        if not run_name.endswith(mode_suffix):
+            variants.append(run_name + mode_suffix)
+            if run_name.endswith("_roadgp"):
+                base = run_name[:-7]
+                variants.append(base + mode_suffix + "_roadgp")
+                variants.append(base + "_roadgp" + mode_suffix)
+            else:
+                variants.append(run_name + "_roadgp" + mode_suffix)
+                variants.append(run_name + mode_suffix + "_roadgp")
 
     return unique_names(variants)
+
 
 
 def resolve_variant_log_dir(parent_dir, requested_name):
