@@ -19,7 +19,7 @@ import torch
 
 # 添加GOPS路径
 sys.path.append("D:\\Project\\GOPS")
-from gops.env.env_matlab.simu_quarter_sus_imp_force import SimuQuarterSusImpForce
+from gops.env.env_matlab.simu_quarter_sus_pilco import SimuQuarterSusPilco
 
 import gpr_lib.Likelihood.Gaussian_likelihood as Likelihood
 import gpr_lib.Utils.Parameters_covariance_functions as cov_func
@@ -99,6 +99,7 @@ p.add_argument("-punish_Q_flec_t", type=float, default=1.0, help="Reward weight 
 p.add_argument("-punish_Q_acc_s_h", type=float, default=2.5, help="High-frequency sprung-acceleration reward weight.")
 p.add_argument("-punish_Q_b_defelc", type=float, default=-80.0, help="Reward barrier weight for deflection.")
 p.add_argument("-cost_l0", type=float, default=1.0, help="Cost function lengthscale for sprung acceleration.")
+p.add_argument("-cost_l_xs", type=float, default=1.0, help="Cost function lengthscale for sprung position.")
 p.add_argument("-cost_l1", type=float, default=0.1, help="Cost function lengthscale for sprung velocity.")
 p.add_argument("-cost_l2", type=float, default=1.0, help="Cost function lengthscale for suspension deflection.")
 p.add_argument("-cost_l3", type=float, default=1.0, help="Cost function lengthscale for deflection velocity.")
@@ -172,7 +173,7 @@ print("---- 创建GOPS Gym环境 ----")
 env_config = {
     "Max_step": Max_step,
     "act_repeat": act_repeat,
-    "obs_scaling": [5, 1, 0.03, 0.3],
+    "obs_scaling": [5, 0.3, 1, 0.03, 0.3],
     "act_scaling": act_scaling,
     "rew_scaling": rew_scaling,
     "act_max": act_max,
@@ -206,16 +207,16 @@ env_config = {
     "punish_Q_acc_s_h": punish_Q_acc_s_h,
     "punish_Q_b_defelc": punish_Q_b_defelc,
 }
-gym_env = SimuQuarterSusImpForce(**env_config)
+gym_env = SimuQuarterSusPilco(**env_config)
 print(f"环境类型: {type(gym_env)}")
 print(f"观测空间: {gym_env.observation_space}")
 print(f"动作空间: {gym_env.action_space}")
 
 print("\n---- 设置环境参数 ----")
-state_dim = 4  # Gym observation: [acc_s, vs, suspension_deflection, v_def] / obs_scaling
+state_dim = 5  # Gym observation: [acc_s, xs, vs, suspension_deflection, v_def] / obs_scaling
 input_dim = 1  # Gym action; physical force = action / act_scaling
 num_gp = state_dim  # Model every Gym observation delta directly
-road_gp_input_dim = 2 if use_road_gp_input else 0  # [z_r, z_r_dot] for GP only
+road_gp_input_dim = 1 if use_road_gp_input else 0  # [z_r] for GP only
 gp_input_dim = state_dim + input_dim + road_gp_input_dim
 u_max = float(gym_env.action_space.high[0])  # Normalized Gym action limit
 std_list = std_noise * np.ones(state_dim)  # 所有状态维度的噪声
@@ -291,7 +292,9 @@ else:
     f_cost_function = Cost_function.Expected_saturated_distance
     cost_function_par = {}
     cost_function_par["target_state"] = torch.zeros(state_dim, dtype=dtype, device=device)
-    cost_function_par["lengthscales"] = torch.tensor([cost_l0, cost_l1, cost_l2, cost_l3], dtype=dtype, device=device)
+    cost_function_par["lengthscales"] = torch.tensor(
+        [cost_l0, cost_l_xs, cost_l1, cost_l2, cost_l3], dtype=dtype, device=device
+    )
     cost_function_par["active_dims"] = np.arange(state_dim)
 
 print("\n---- 设置初始状态 ----")
@@ -321,9 +324,7 @@ if run_name is None and use_road_gp_input:
     resolved_run_name = safe_path_name(resolved_run_name + "_roadgp")
 log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name)
 if os.path.isdir(log_path) and os.listdir(log_path) and not overwrite_existing:
-    raise FileExistsError(
-        "结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path)
-    )
+    raise FileExistsError("结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path))
 os.makedirs(log_path, exist_ok=True)
 experiment_info = {
     "created_at": datetime.now().isoformat(timespec="seconds"),

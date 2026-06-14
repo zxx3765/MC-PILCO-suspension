@@ -993,6 +993,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json({"success": True, "plots": []})
 
+        # 5.5 打开本地实验结果目录接口
+        elif parsed_path == "/api/open_folder":
+            run_name = query_params.get("run_name")
+            seed = query_params.get("seed", "1")
+            result_root = query_params.get("result_root", "./results_tmp/quarter_car_gym")
+            
+            if not run_name:
+                self.send_json({"success": False, "message": "必须提供 run_name。"}, 400)
+                return
+                
+            run_dir = resolve_run_dir(result_root, seed, run_name)
+            if os.path.exists(run_dir):
+                try:
+                    abs_path = os.path.abspath(run_dir)
+                    if hasattr(os, "startfile"):
+                        os.startfile(abs_path)
+                    else:
+                        import subprocess
+                        if sys.platform == "win32":
+                            os.startfile(abs_path)
+                        elif sys.platform == "darwin":
+                            subprocess.Popen(["open", abs_path])
+                        else:
+                            subprocess.Popen(["xdg-open", abs_path])
+                    self.send_json({"success": True, "message": f"已成功打开目录: {run_dir}"})
+                except Exception as e:
+                    self.send_json({"success": False, "error": str(e)}, 500)
+            else:
+                self.send_json({"success": False, "message": f"目录不存在: {run_dir}"}, 404)
+
         # 6. 单个实验图片文件加载接口
         elif parsed_path == "/api/plot_file":
             run_name = query_params.get("run_name")

@@ -948,6 +948,7 @@ class Model_learning_Quarter_Car_Gym_State_Reconstruction(Model_learning_RBF_ang
     GP inputs: [suspension_deflection, v_def, vs, vu, u]
     GP outputs: [acc_s_change, vs_change, suspension_deflection_change, v_def_change]
     """
+
     def __init__(
         self,
         num_gp,
@@ -986,9 +987,14 @@ class Model_learning_Quarter_Car_Gym_State_Reconstruction(Model_learning_RBF_ang
         v_u = v_s - v_def
         """
         unscaled_states = states * self.obs_scaling
-        v_s = unscaled_states[:, 1:2]                  # sprung velocity
-        susp_def = unscaled_states[:, 2:3]             # suspension deflection
-        v_def = unscaled_states[:, 3:4]                # suspension deflection velocity
+        if states.shape[1] == 5:
+            v_s = unscaled_states[:, 2:3]  # sprung velocity
+            susp_def = unscaled_states[:, 3:4]  # suspension deflection
+            v_def = unscaled_states[:, 4:5]  # suspension deflection velocity
+        else:
+            v_s = unscaled_states[:, 1:2]  # sprung velocity
+            susp_def = unscaled_states[:, 2:3]  # suspension deflection
+            v_def = unscaled_states[:, 3:4]  # suspension deflection velocity
 
         # Reconstruct unsprung velocity
         v_u = v_s - v_def
@@ -1010,6 +1016,7 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
     GP inputs: [suspension_deflection, v_def, vs, vu, u] (reconstructed physical coordinate space)
     GP targets: delta_obs_observed - delta_obs_physics
     """
+
     def __init__(
         self,
         num_gp,
@@ -1064,9 +1071,14 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         v_u = v_s - v_def
         """
         unscaled_states = states * self.obs_scaling
-        v_s = unscaled_states[:, 1:2]
-        susp_def = unscaled_states[:, 2:3]
-        v_def = unscaled_states[:, 3:4]
+        if states.shape[1] == 5:
+            v_s = unscaled_states[:, 2:3]
+            susp_def = unscaled_states[:, 3:4]
+            v_def = unscaled_states[:, 4:5]
+        else:
+            v_s = unscaled_states[:, 1:2]
+            susp_def = unscaled_states[:, 2:3]
+            v_def = unscaled_states[:, 3:4]
         v_u = v_s - v_def
         reconstructed_states = torch.cat([susp_def, v_def, v_s, v_u], dim=1)
         gp_in = torch.cat([reconstructed_states, inputs], dim=1)
@@ -1082,10 +1094,17 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         (Assuming z_r = 0, z_r_dot = 0)
         """
         unscaled_states = states * self.obs_scaling
-        acc_s = unscaled_states[:, 0:1]                 # physical sprung mass acceleration
-        v_s = unscaled_states[:, 1:2]                   # physical sprung mass velocity
-        susp_def = unscaled_states[:, 2:3]              # physical suspension deflection (z_s - z_u)
-        v_def = unscaled_states[:, 3:4]                 # physical deflection velocity (z_s_dot - z_u_dot)
+        if states.shape[1] == 5:
+            acc_s = unscaled_states[:, 0:1]  # physical sprung mass acceleration
+            x_s = unscaled_states[:, 1:2]  # physical sprung mass position
+            v_s = unscaled_states[:, 2:3]  # physical sprung mass velocity
+            susp_def = unscaled_states[:, 3:4]  # physical suspension deflection (z_s - z_u)
+            v_def = unscaled_states[:, 4:5]  # physical deflection velocity (z_s_dot - z_u_dot)
+        else:
+            acc_s = unscaled_states[:, 0:1]  # physical sprung mass acceleration
+            v_s = unscaled_states[:, 1:2]  # physical sprung mass velocity
+            susp_def = unscaled_states[:, 2:3]  # physical suspension deflection (z_s - z_u)
+            v_def = unscaled_states[:, 3:4]  # physical deflection velocity (z_s_dot - z_u_dot)
 
         # Reconstruct physical wheel velocity
         v_u = v_s - v_def
@@ -1100,7 +1119,7 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         # Calculate nominal physical tire force (assuming z_r = 0, z_r_dot = 0)
         # We assume F_tire = 0 as a baseline since tire deflection is tiny and oscillates around 0.
         # This prevents massive fictitious forces when z_u is unknown.
-        F_tire = torch.zeros_like(susp_def)
+        F_tire = torch.zeros_like(susp_def)  # hat!!
 
         # Calculate nominal sprung and unsprung accelerations
         z_s_ddot = (-F_susp + u_phys) / self.m_s
@@ -1110,15 +1129,16 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         delta_v_s = acc_s * self.T_sampling
         delta_susp_def = v_def * self.T_sampling
         delta_v_def = (acc_s - z_u_ddot) * self.T_sampling
-
-        # Acceleration change is modeled as 0 in nominal dynamics
         delta_acc_s = torch.zeros_like(acc_s)
 
         # Combine nominal physical changes
-        delta_phys_unscaled = torch.cat([delta_acc_s, delta_v_s, delta_susp_def, delta_v_def], dim=1)
-
-        # Scale back to scaled observation space
-        return delta_phys_unscaled / self.obs_scaling
+        if states.shape[1] == 5:
+            delta_x_s = v_s * self.T_sampling
+            delta_phys_unscaled = torch.cat([delta_acc_s, delta_x_s, delta_v_s, delta_susp_def, delta_v_def], dim=1)
+            return delta_phys_unscaled / self.obs_scaling
+        else:
+            delta_phys_unscaled = torch.cat([delta_acc_s, delta_v_s, delta_susp_def, delta_v_def], dim=1)
+            return delta_phys_unscaled / self.obs_scaling
 
     def data_to_gp_IO(self, states, inputs, exogenous_inputs=None):
         """

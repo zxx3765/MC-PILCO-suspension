@@ -222,9 +222,14 @@ def suspension_evaluation_cost(
     """
     # obs_scaling = [5.0, 1.0, 0.03, 0.3]
     # states_sequence: [num_instants, num_particles, state_dim]
-    acc_s = states_sequence[:, :, 0] * obs_scaling[0]
-    travel = states_sequence[:, :, 2] * obs_scaling[2]
-    tire = states_sequence[:, :, 3] * obs_scaling[3]
+    if states_sequence.shape[-1] == 5:
+        acc_s = states_sequence[:, :, 0] * obs_scaling[0]
+        travel = states_sequence[:, :, 3] * obs_scaling[3]
+        tire = states_sequence[:, :, 4] * obs_scaling[4]
+    else:
+        acc_s = states_sequence[:, :, 0] * obs_scaling[0]
+        travel = states_sequence[:, :, 2] * obs_scaling[2]
+        tire = states_sequence[:, :, 3] * obs_scaling[3]
 
     c_acc = 1.0 - torch.exp(-((acc_s / l_acc) ** 2))
     c_tire = 1.0 - torch.exp(-((tire / l_tire) ** 2))

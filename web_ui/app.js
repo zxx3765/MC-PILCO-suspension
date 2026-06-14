@@ -55,6 +55,7 @@ document.addEventListener("DOMContentLoaded", () => {
     
     // DOM Elements - Analysis tab
     const loadPlotsBtn = document.getElementById("load-plots-btn");
+    const openFolderBtn = document.getElementById("open-folder-btn");
     const analysisRunSelect = document.getElementById("analysis-run-select");
     const analysisSeedInput = document.getElementById("analysis-seed-input");
     const analysisRootInput = document.getElementById("analysis-root-input");
@@ -1184,6 +1185,27 @@ document.addEventListener("DOMContentLoaded", () => {
             return;
         }
         uploadRunToLeaderboard(runName, seed, root);
+    });
+
+    openFolderBtn.addEventListener("click", async () => {
+        const runName = analysisRunSelect.value;
+        const seed = analysisSeedInput.value;
+        const root = analysisRootInput.value;
+        if (!runName) {
+            alert("请先选择一个实验！");
+            return;
+        }
+        try {
+            const res = await fetch(`${API_BASE}/api/open_folder?run_name=${encodeURIComponent(runName)}&seed=${encodeURIComponent(seed)}&result_root=${encodeURIComponent(root)}`);
+            const data = await res.json();
+            if (data.success) {
+                appendConsoleLine(`[SYSTEM] 已成功打开实验目录: ${runName}`, "system-msg");
+            } else {
+                alert(`打开目录失败: ${data.message || data.error}`);
+            }
+        } catch (err) {
+            alert("与后端服务器通信失败: " + err);
+        }
     });
 
     // Delete single entry (event delegation)

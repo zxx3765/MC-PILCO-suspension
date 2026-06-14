@@ -33,7 +33,6 @@ class Gym_Model:
             reset_kwargs: optional keyword arguments forwarded to env.reset
             collect_road: if True, also return [z_r, z_r_dot] sampled from env info
         """
-        state_dim = len(s0)
         times = np.linspace(0, T, int(T / dt) + 1)
 
         # Reset environment with initial state and optional deterministic reset parameters.
@@ -57,6 +56,7 @@ class Gym_Model:
             obs = reset_result
 
         states = obs.reshape(1, -1)
+        state_dim = states.shape[1]
         noisy_states = states + np.random.randn(state_dim) * noise
         road_samples = []
 

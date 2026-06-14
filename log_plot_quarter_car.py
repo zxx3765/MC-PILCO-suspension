@@ -252,7 +252,22 @@ def replay_gym_env(env, initial_state, reset_kwargs, actions, length):
             env.reset()
 
     try:
-        init_info = list(env.env.model_class.quarter_sus_imp_force_Y.info)
+        model_class = env.env.model_class
+        if hasattr(model_class, "quarter_sus_imp_force_Y"):
+            init_info = list(model_class.quarter_sus_imp_force_Y.info)
+        elif hasattr(model_class, "quarter_sus_pilco_Y"):
+            init_info = list(model_class.quarter_sus_pilco_Y.info)
+        else:
+            # Dynamically locate any attribute ending in _Y and containing 'info'
+            info_found = False
+            for attr in dir(model_class):
+                obj = getattr(model_class, attr)
+                if hasattr(obj, "info"):
+                    init_info = list(obj.info)
+                    info_found = True
+                    break
+            if not info_found:
+                init_info = [0.0] * 8
     except AttributeError:
         init_info = [0.0] * 8
 
@@ -639,14 +654,41 @@ def main():
         gops_path = "D:\\Project\\GOPS"
         if gops_path not in sys.path:
             sys.path.append(gops_path)
-        from gops.env.env_matlab.simu_quarter_sus_imp_force import SimuQuarterSusImpForce
+
+        # Try to parse and dynamically load the environment class used during training
+        env_class_str = MC_PILCO_init_dict.get("gym_env", "")
+        import re
+        match = re.search(r"class\s+'([^']+)'", env_class_str)
+        EnvClass = None
+        if match:
+            full_class_name = match.group(1)
+            try:
+                module_name, class_name = full_class_name.rsplit('.', 1)
+                import importlib
+                module = importlib.import_module(module_name)
+                EnvClass = getattr(module, class_name)
+                print("Dynamically loaded gym environment class: {}".format(EnvClass))
+            except Exception as e:
+                print("Warning: failed to dynamically load {}: {}".format(full_class_name, e))
+
+        if EnvClass is None:
+            # Fallback to SimuQuarterSusImpForce
+            from gops.env.env_matlab.simu_quarter_sus_imp_force import SimuQuarterSusImpForce
+            EnvClass = SimuQuarterSusImpForce
 
         env_config = config_log_dict.get("env_config", None)
         if env_config is not None:
             gym_obs_scale = np.asarray(env_config.get("obs_scaling", gym_obs_scale), dtype=float)
             gym_act_scale = float(np.asarray(env_config.get("act_scaling", gym_act_scale)))
             gym_act_max = float(np.asarray(env_config.get("act_max", gym_act_max)))
-            gym_env = SimuQuarterSusImpForce(**env_config)
+
+            # Adjust obs_scaling length if the loaded EnvClass is SimuQuarterSusImpForce and obs_scaling has 5 elements
+            env_config_copy = dict(env_config)
+            if EnvClass.__name__ == "SimuQuarterSusImpForce" and "obs_scaling" in env_config_copy and len(env_config_copy["obs_scaling"]) == 5:
+                obs_5 = env_config_copy["obs_scaling"]
+                env_config_copy["obs_scaling"] = [obs_5[0], obs_5[2], obs_5[3], obs_5[4]]
+
+            gym_env = EnvClass(**env_config_copy)
             passive_model = gym_env
     else:
         passive_model = Model(MC_PILCO_init_dict["ode_fun"])

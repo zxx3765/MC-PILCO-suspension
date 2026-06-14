@@ -161,7 +161,7 @@ class MC_PILCO(torch.nn.Module):
                         num_init = np.random.randint(initial_state.shape[0])
                         x0 = np.random.normal(initial_state[num_init, :], np.sqrt(initial_state_var[num_init, :]))
                     else:  # gaussian initial distribution
-                        x0 = np.random.normal(initial_state, np.sqrt(initial_state_var))
+                        x0 = np.random.normal(initial_state, np.sqrt(initial_state_var[: len(initial_state)]))
                 else:  # deterministic initial state
                     x0 = initial_state
 
@@ -187,6 +187,7 @@ class MC_PILCO(torch.nn.Module):
             parameters_trial_list = []
             particles_states_list = []
             particles_inputs_list = []
+            self.gp_fitting_history = {"train_mse": [], "val_mse": []}
 
             first_trial_index = num_explorations - 1
             last_trial_index = num_trials + num_explorations - 1
@@ -197,6 +198,7 @@ class MC_PILCO(torch.nn.Module):
             parameters_trial_list = self.log_dict["parameters_trial_list"]
             particles_states_list = self.log_dict["particles_states_list"]
             particles_inputs_list = self.log_dict["particles_inputs_list"]
+            self.gp_fitting_history = self.log_dict.get("gp_fitting_history", {"train_mse": [], "val_mse": []})
 
             num_past_trials = len(self.state_samples_history)
             first_trial_index = num_past_trials - 1
@@ -208,6 +210,9 @@ class MC_PILCO(torch.nn.Module):
             # train GPs on observed interaction data
             print("\n\n----- REINFORCE THE MODEL -----")
             self.model_learning.reinforce_model(optimization_opt_list=model_optimization_opt_list)
+
+            # Evaluate GP fitting performance and generate plots
+            self.evaluate_and_plot_gp_fitting(trial_index)
 
             with torch.no_grad():
                 if self.log_path is not None:
@@ -223,6 +228,7 @@ class MC_PILCO(torch.nn.Module):
                     self.log_dict["noiseless_states_history"] = self.noiseless_states_history
                     self.log_dict["exogenous_samples_history"] = self.exogenous_samples_history
                     self.log_dict["road_profile"] = road_profile
+                    self.log_dict["gp_fitting_history"] = self.gp_fitting_history
                     os.makedirs(self.log_path, exist_ok=True)
                     pkl.dump(self.log_dict, open(self.log_path + "/log.pkl", "wb"))
 
@@ -241,7 +247,21 @@ class MC_PILCO(torch.nn.Module):
                     particles_init_low_bound = None
 
                 particles_initial_state_mean = torch.tensor(initial_state, dtype=self.dtype, device=self.device)
+                if particles_initial_state_mean.shape[0] < self.state_dim:
+                    padding = torch.zeros(
+                        self.state_dim - particles_initial_state_mean.shape[0],
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    particles_initial_state_mean = torch.cat([particles_initial_state_mean, padding])
                 particles_initial_state_var = torch.tensor(initial_state_var, dtype=self.dtype, device=self.device)
+                if particles_initial_state_var.shape[0] < self.state_dim:
+                    padding = 1e-6 * torch.ones(
+                        self.state_dim - particles_initial_state_var.shape[0],
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    particles_initial_state_var = torch.cat([particles_initial_state_var, padding])
 
             print("\n\n----- REINFORCE THE POLICY -----")
             self.model_learning.set_eval_mode()
@@ -285,7 +305,7 @@ class MC_PILCO(torch.nn.Module):
                     num_init = np.random.randint(initial_state.shape[0])
                     x0 = np.random.normal(initial_state[num_init, :], np.sqrt(initial_state_var[num_init, :]))
                 else:
-                    x0 = np.random.normal(initial_state, np.sqrt(initial_state_var))
+                    x0 = np.random.normal(initial_state, np.sqrt(initial_state_var[: len(initial_state)]))
             else:
                 x0 = initial_state
 
@@ -374,6 +394,208 @@ class MC_PILCO(torch.nn.Module):
         # plt.show()
 
         return gp_inputs, gp_outputs_target_list, gp_output_mean_list, gp_output_var_list
+
+    def _get_validation_exogenous_tensor(self, trial_index):
+        if not self._uses_exogenous_inputs():
+            return None
+        if not hasattr(self, "validation_exogenous_samples_history"):
+            return None
+        if trial_index >= len(self.validation_exogenous_samples_history):
+            return None
+        exogenous_samples = self.validation_exogenous_samples_history[trial_index]
+        if exogenous_samples is None:
+            return None
+        return torch.tensor(exogenous_samples, dtype=self.dtype, device=self.device)
+
+    def evaluate_and_plot_gp_fitting(self, trial_index):
+        """
+        Evaluate GP fitting performance on train and validation datasets.
+        Saves MSE values to json/pkl logs and plots residual overlays and MSE trends.
+        """
+        import json
+        import matplotlib.pyplot as plt
+
+        # Determine if we have training rollout data at this trial
+        if trial_index >= len(self.state_samples_history):
+            print("[GP Fitting Evaluation] Warning: trial_index {} out of range of state_samples_history (len: {})".format(
+                trial_index, len(self.state_samples_history)
+            ))
+            return
+
+        states_tr = self.state_samples_history[trial_index]
+        inputs_tr = self.input_samples_history[trial_index]
+        exogenous_tr = self._get_exogenous_history_tensor(trial_index)
+
+        # Predict GP on training data
+        with torch.no_grad():
+            gp_inputs_tr, gp_targets_tr, gp_mean_tr, gp_var_tr = self.model_learning.get_gp_estimate_from_data(
+                states=torch.tensor(states_tr, dtype=self.dtype, device=self.device),
+                inputs=torch.tensor(inputs_tr, dtype=self.dtype, device=self.device),
+                exogenous_inputs=exogenous_tr,
+            )
+
+        # Compute train MSE
+        train_mse_list = []
+        for i in range(self.model_learning.num_gp):
+            target = gp_targets_tr[i].detach().cpu().numpy()
+            pred = gp_mean_tr[i].detach().cpu().numpy()
+            mse = ((target - pred) ** 2).mean()
+            train_mse_list.append(float(mse))
+
+        # Check for validation data
+        has_val = (
+            hasattr(self, "validation_state_samples_history")
+            and len(self.validation_state_samples_history) > trial_index
+            and self.validation_state_samples_history[trial_index] is not None
+        )
+
+        val_mse_list = []
+        gp_targets_val, gp_mean_val, gp_var_val = None, None, None
+        if has_val:
+            states_val = self.validation_state_samples_history[trial_index]
+            inputs_val = self.validation_input_samples_history[trial_index]
+            exogenous_val = self._get_validation_exogenous_tensor(trial_index)
+
+            with torch.no_grad():
+                _, gp_targets_val, gp_mean_val, gp_var_val = self.model_learning.get_gp_estimate_from_data(
+                    states=torch.tensor(states_val, dtype=self.dtype, device=self.device),
+                    inputs=torch.tensor(inputs_val, dtype=self.dtype, device=self.device),
+                    exogenous_inputs=exogenous_val,
+                )
+
+            for i in range(self.model_learning.num_gp):
+                target = gp_targets_val[i].detach().cpu().numpy()
+                pred = gp_mean_val[i].detach().cpu().numpy()
+                mse = ((target - pred) ** 2).mean()
+                val_mse_list.append(float(mse))
+
+        # Print fitting metrics to console
+        print("\n[GP Fitting Evaluation] Trial {}".format(trial_index))
+        for i in range(self.model_learning.num_gp):
+            val_str = ", Val MSE: {:.6e}".format(val_mse_list[i]) if val_mse_list else ""
+            print("  GP {} - Train MSE: {:.6e}{}".format(i, train_mse_list[i], val_str))
+
+        # Save to history dictionary
+        self.gp_fitting_history["train_mse"].append(train_mse_list)
+        if val_mse_list:
+            self.gp_fitting_history["val_mse"].append(val_mse_list)
+
+        # Save to self.log_dict
+        if self.log_path is not None:
+            self.log_dict["gp_fitting_history"] = self.gp_fitting_history
+            
+            # Write metrics JSON file
+            json_path = os.path.join(self.log_path, "gp_fitting_metrics.json")
+            try:
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(self.gp_fitting_history, f, indent=2)
+            except Exception as e:
+                print("[GP Fitting Evaluation] Warning: failed to save JSON metrics: {}".format(e))
+
+            # Define descriptive labels based on state dimension
+            if self.state_dim == 5:
+                gp_labels = [
+                    "Comfort Sprung Acc",
+                    "Sprung Position",
+                    "Sprung Velocity",
+                    "Suspension Deflection",
+                    "Deflection Velocity"
+                ]
+            elif self.state_dim == 4:
+                gp_labels = [
+                    "Sprung Velocity",
+                    "Suspension Deflection",
+                    "Deflection Velocity",
+                    "Unsprung Velocity"
+                ]
+            else:
+                gp_labels = [f"GP Dim {i}" for i in range(self.state_dim)]
+            
+            gp_labels = ["{} (Scaled Residual)".format(label) for label in gp_labels]
+
+            # Plot 1: Actual vs Predicted residuals overlay plot
+            eval_source = "validation" if has_val else "train"
+            targets_to_plot = gp_targets_val if has_val else gp_targets_tr
+            means_to_plot = gp_mean_val if has_val else gp_mean_tr
+            vars_to_plot = gp_var_val if has_val else gp_var_tr
+            mses_to_plot = val_mse_list if has_val else train_mse_list
+
+            fig, axes = plt.subplots(self.model_learning.num_gp, 1, figsize=(10, 2.5 * self.model_learning.num_gp), sharex=True, constrained_layout=True)
+            if self.model_learning.num_gp == 1:
+                axes = [axes]
+            
+            for i in range(self.model_learning.num_gp):
+                target = targets_to_plot[i].detach().cpu().numpy()
+                pred_mean = means_to_plot[i].detach().cpu().numpy()
+                norm_scale = self.model_learning.norm_list[i]
+                pred_var = vars_to_plot[i].detach().cpu().numpy() * (norm_scale ** 2)
+                pred_std = np.sqrt(np.clip(pred_var, 1e-12, None))
+
+                time_axis = np.arange(len(target)) * self.T_sampling
+                ax = axes[i]
+                ax.plot(time_axis, target[:, 0], color='#333333', linewidth=1.2, label='True Residual')
+                ax.plot(time_axis, pred_mean[:, 0], color='#d62728', linewidth=1.5, label='GP Prediction (Mean)')
+                ax.fill_between(time_axis, (pred_mean - 2 * pred_std)[:, 0], (pred_mean + 2 * pred_std)[:, 0], color='#d62728', alpha=0.15, label='95% Confidence Interval')
+                ax.grid(True, alpha=0.28)
+                ax.set_ylabel(gp_labels[i], fontsize=9)
+                ax.text(0.012, 0.96, "MSE={:.3e}".format(mses_to_plot[i]), transform=ax.transAxes, va='top', ha='left', fontsize=8.5,
+                        bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor='0.8', alpha=0.85))
+                if i == 0:
+                    ax.legend(loc='upper right', frameon=False, ncol=3, fontsize=8)
+
+            axes[-1].set_xlabel('Time [s]')
+            fig.suptitle("GP Fitting Residuals on {} (Trial {})".format(eval_source.capitalize(), trial_index), fontsize=12)
+            
+            fig_path = os.path.join(self.log_path, "gp_fit_{}_trial_{}.png".format(eval_source, trial_index))
+            try:
+                fig.savefig(fig_path, dpi=300)
+                plt.close(fig)
+            except Exception as e:
+                print("[GP Fitting Evaluation] Warning: failed to save fit plot: {}".format(e))
+
+            # Plot 2: GP MSE Trend plot over trials
+            try:
+                train_mse_arr = np.array(self.gp_fitting_history["train_mse"])
+                trials_range = np.arange(len(train_mse_arr))
+
+                if val_mse_list:
+                    val_mse_arr = np.array(self.gp_fitting_history["val_mse"])
+                    fig_trend, (ax_tr, ax_val) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+                    
+                    for i in range(self.model_learning.num_gp):
+                        ax_tr.plot(trials_range, train_mse_arr[:, i], marker='o', linewidth=1.5, label=gp_labels[i])
+                        ax_val.plot(trials_range, val_mse_arr[:, i], marker='s', linewidth=1.5, label=gp_labels[i])
+                    
+                    ax_tr.set_yscale('log')
+                    ax_tr.set_xlabel('Trial')
+                    ax_tr.set_ylabel('MSE (Log Scale)')
+                    ax_tr.set_title('GP Train MSE Trend')
+                    ax_tr.grid(True, which="both", ls="--", alpha=0.3)
+                    ax_tr.legend(loc='upper right', frameon=False, fontsize=8.5)
+
+                    ax_val.set_yscale('log')
+                    ax_val.set_xlabel('Trial')
+                    ax_val.set_ylabel('MSE (Log Scale)')
+                    ax_val.set_title('GP Validation MSE Trend')
+                    ax_val.grid(True, which="both", ls="--", alpha=0.3)
+                    ax_val.legend(loc='upper right', frameon=False, fontsize=8.5)
+                else:
+                    fig_trend, ax_tr = plt.subplots(figsize=(8, 5), constrained_layout=True)
+                    for i in range(self.model_learning.num_gp):
+                        ax_tr.plot(trials_range, train_mse_arr[:, i], marker='o', linewidth=1.5, label=gp_labels[i])
+                    
+                    ax_tr.set_yscale('log')
+                    ax_tr.set_xlabel('Trial')
+                    ax_tr.set_ylabel('MSE (Log Scale)')
+                    ax_tr.set_title('GP Train MSE Trend')
+                    ax_tr.grid(True, which="both", ls="--", alpha=0.3)
+                    ax_tr.legend(loc='upper right', frameon=False, fontsize=8.5)
+
+                trend_path = os.path.join(self.log_path, "gp_error_trend.png")
+                fig_trend.savefig(trend_path, dpi=300)
+                plt.close(fig_trend)
+            except Exception as e:
+                print("[GP Fitting Evaluation] Warning: failed to save trend plot: {}".format(e))
 
     def get_rollout_prediction_performance(
         self, data_collection_index, T_rollout=None, add_name="", particle_pred=False
