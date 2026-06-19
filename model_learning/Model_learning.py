@@ -246,6 +246,7 @@ class Model_learning(torch.nn.Module):
             gp_output_mean_list=gp_output_mean_list,
             gp_output_var_list=gp_output_var_list,
             particle_pred=particle_pred,
+            exogenous_input=exogenous_input,
         )
 
     def get_one_step_gp_out(self, states, inputs, exogenous_input=None):
@@ -500,7 +501,13 @@ class Model_learning(torch.nn.Module):
         )
 
     def get_next_state_from_gp_output(
-        self, current_state, current_input, gp_output_mean_list, gp_output_var_list, particle_pred=True
+        self,
+        current_state,
+        current_input,
+        gp_output_mean_list,
+        gp_output_var_list,
+        particle_pred=True,
+        exogenous_input=None,
     ):
         """
         Returns next state samples with mean and variance of GP outputs, given:
@@ -753,7 +760,13 @@ class Speed_Model_learning_RBF_angle_state(Model_learning):
         return torch.cat([extended_states, inputs], 1)
 
     def get_next_state_from_gp_output(
-        self, current_state, current_input, gp_output_mean_list, gp_output_var_list, particle_pred=True
+        self,
+        current_state,
+        current_input,
+        gp_output_mean_list,
+        gp_output_var_list,
+        particle_pred=True,
+        exogenous_input=None,
     ):
         """
         Returns next state samples with mean and variance of GP outputs, given:
@@ -907,7 +920,13 @@ class SP_Speed_Model_learning_Furuta(Model_learning):
         return extended_states
 
     def get_next_state_from_gp_output(
-        self, current_state, current_input, gp_output_mean_list, gp_output_var_list, particle_pred=True
+        self,
+        current_state,
+        current_input,
+        gp_output_mean_list,
+        gp_output_var_list,
+        particle_pred=True,
+        exogenous_input=None,
     ):
         """
         Returns next state samples with mean and variance of GP outputs, given:
@@ -1014,6 +1033,7 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
     """
     Model learning class for Gym Quarter Car that does physics-informed residual learning.
     GP inputs: [suspension_deflection, v_def, vs, vu, u] (reconstructed physical coordinate space)
+    If road-aware GP inputs are enabled, [z_r, z_r_dot] are appended and also used by the physics prior.
     GP targets: delta_obs_observed - delta_obs_physics
     """
 
@@ -1088,10 +1108,10 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
             gp_in = torch.cat([gp_in, exogenous_inputs], dim=1)
         return gp_in
 
-    def get_physics_delta_obs(self, states, inputs):
+    def get_physics_delta_obs(self, states, inputs, exogenous_inputs=None):
         """
         Calculates nominal physical observation changes in scaled observation space over T_sampling
-        (Assuming z_r = 0, z_r_dot = 0)
+        using the same road displacement/velocity convention as the Gym wrapper when available.
         """
         unscaled_states = states * self.obs_scaling
         if states.shape[1] == 5:
@@ -1108,18 +1128,29 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
 
         # Reconstruct physical wheel velocity
         v_u = v_s - v_def
-        # Reconstruct physical wheel displacement (approximating z_s ≈ 0, so z_u ≈ -susp_def)
-        z_u = -susp_def
+        # Reconstruct physical wheel displacement. Gym observations include z_s as x_s; the 4D fallback does not.
+        if states.shape[1] == 5:
+            z_u = x_s - susp_def
+        else:
+            z_u = -susp_def
+
+        if exogenous_inputs is not None:
+            z_r = exogenous_inputs[:, 0:1]
+            if exogenous_inputs.shape[1] > 1:
+                z_r_dot = exogenous_inputs[:, 1:2]
+            else:
+                z_r_dot = torch.zeros_like(z_r)
+        else:
+            z_r = torch.zeros_like(susp_def)
+            z_r_dot = torch.zeros_like(susp_def)
 
         # Physical force from action (Gym action is scaled, physical force = action / act_scaling)
         u_phys = inputs[:, 0:1] / self.act_scaling
 
         # Calculate nominal physical suspension force
         F_susp = self.k_s * susp_def + self.c_s * v_def
-        # Calculate nominal physical tire force (assuming z_r = 0, z_r_dot = 0)
-        # We assume F_tire = 0 as a baseline since tire deflection is tiny and oscillates around 0.
-        # This prevents massive fictitious forces when z_u is unknown.
-        F_tire = torch.zeros_like(susp_def)  # hat!!
+        # Calculate nominal physical tire force from road-aware tire deflection.
+        F_tire = self.k_t * (z_u - z_r) + self.c_t * (v_u - z_r_dot)
 
         # Calculate nominal sprung and unsprung accelerations
         z_s_ddot = (-F_susp + u_phys) / self.m_s
@@ -1150,7 +1181,8 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         observed_delta = states[1:] - states[:-1]
 
         # Nominal physics differences in scaled observation space
-        physics_delta = self.get_physics_delta_obs(states[:-1], inputs[:-1])
+        physics_exogenous = exogenous_inputs[:-1] if exogenous_inputs is not None else None
+        physics_delta = self.get_physics_delta_obs(states[:-1], inputs[:-1], exogenous_inputs=physics_exogenous)
 
         # Residuals to be learned by GP
         residuals = observed_delta - physics_delta
@@ -1161,7 +1193,13 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         return gp_inputs, gp_output_list
 
     def get_next_state_from_gp_output(
-        self, current_state, current_input, gp_output_mean_list, gp_output_var_list, particle_pred=True
+        self,
+        current_state,
+        current_input,
+        gp_output_mean_list,
+        gp_output_var_list,
+        particle_pred=True,
+        exogenous_input=None,
     ):
         """
         Reconstructs the next observation by adding GP residual predictions back to nominal physical updates
@@ -1171,7 +1209,7 @@ class Model_learning_Quarter_Car_Gym_Physics_Residual(Model_learning_RBF_angle_s
         residual_var = torch.cat(gp_output_var_list, dim=1)
 
         # Nominal physics change in scaled space
-        physics_delta = self.get_physics_delta_obs(current_state, current_input)
+        physics_delta = self.get_physics_delta_obs(current_state, current_input, exogenous_inputs=exogenous_input)
 
         # Total observation change in scaled space
         delta_obs_mean = physics_delta + residual_mean

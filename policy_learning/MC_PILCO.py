@@ -127,6 +127,9 @@ class MC_PILCO(torch.nn.Module):
             sequence[:, particle_index, :] = torch.tensor(sample, dtype=self.dtype, device=self.device)
         return sequence
 
+    def _policy_input_with_exogenous(self, states, t=None, p_dropout=0.0, exogenous_input=None):
+        return self.control_policy(states, t=t, p_dropout=p_dropout, exogenous_input=exogenous_input)
+
     def reinforce(
         self,
         initial_state,
@@ -343,6 +346,11 @@ class MC_PILCO(torch.nn.Module):
 
             print("\n\n----- CHECK THE ROLLOUT PERFORMANCE (before model update) -----")
             _, _, _ = self.get_rollout_prediction_performance(data_collection_index=trial_index + 1, add_name="pre_tr")
+
+        if hasattr(self, "finalize_best_validation_policy"):
+            self.finalize_best_validation_policy()
+            if self.log_path is not None:
+                pkl.dump(self.log_dict, open(self.log_path + "/log.pkl", "wb"))
 
         return cost_trial_list, particles_states_list, particles_inputs_list
 
@@ -951,8 +959,13 @@ class MC_PILCO(torch.nn.Module):
         states_sequence_list.append(state_distribution.rsample())
 
         # compute initial inputs
-        inputs_sequence_list.append(self.control_policy(states_sequence_list[0], t=0, p_dropout=p_dropout))
         exogenous_sequence = self.sample_exogenous_sequence(int(T_control), num_particles)
+        initial_exogenous = None if exogenous_sequence is None else exogenous_sequence[0]
+        inputs_sequence_list.append(
+            self._policy_input_with_exogenous(
+                states_sequence_list[0], t=0, p_dropout=p_dropout, exogenous_input=initial_exogenous
+            )
+        )
 
         for t in range(1, int(T_control)):
 
@@ -965,7 +978,12 @@ class MC_PILCO(torch.nn.Module):
             states_sequence_list.append(particles)
 
             # compute next input
-            inputs_sequence_list.append(self.control_policy(states_sequence_list[t], t=t, p_dropout=p_dropout))
+            current_exogenous = None if exogenous_sequence is None else exogenous_sequence[t]
+            inputs_sequence_list.append(
+                self._policy_input_with_exogenous(
+                    states_sequence_list[t], t=t, p_dropout=p_dropout, exogenous_input=current_exogenous
+                )
+            )
 
         # returns states/inputs trajectories
         return torch.stack(states_sequence_list), torch.stack(inputs_sequence_list)

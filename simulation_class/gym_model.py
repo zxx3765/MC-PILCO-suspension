@@ -64,7 +64,10 @@ class Gym_Model:
             road_samples.append(self._get_road_position_from_env())
 
         # Get initial input
-        inputs = np.array([policy(noisy_states[0, :], 0)]).reshape(1, -1)
+        initial_exogenous = None
+        if collect_road:
+            initial_exogenous = np.array([road_samples[0], 0.0], dtype=float)
+        inputs = np.array([policy(noisy_states[0, :], 0, initial_exogenous)]).reshape(1, -1)
 
         # Rollout
         for k in range(1, len(times)):
@@ -84,7 +87,13 @@ class Gym_Model:
                 road_samples.append(self._get_road_position_from_info(info_dict))
 
             # Compute next input
-            u_next = np.array([policy(noisy_states[k, :], times[k])]).reshape(1, -1)
+            if collect_road:
+                road_dt = self._get_road_sample_time(dt)
+                current_road_speed = 0.0 if k == 0 else (road_samples[k] - road_samples[k - 1]) / road_dt
+                exogenous_input = np.array([road_samples[k], current_road_speed], dtype=float)
+            else:
+                exogenous_input = None
+            u_next = np.array([policy(noisy_states[k, :], times[k], exogenous_input)]).reshape(1, -1)
             inputs = np.append(inputs, u_next, axis=0)
 
         if collect_road:

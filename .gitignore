@@ -173,3 +173,5 @@ cython_debug/
 
 results_tmp/*
 launcher_configs/*
+debug/*
+.vscode/*

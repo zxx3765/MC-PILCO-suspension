@@ -5,6 +5,8 @@
 MC-PILCO for Gym environments
 """
 
+import copy
+
 import numpy as np
 
 import simulation_class.gym_model as gym_model
@@ -92,6 +94,10 @@ class MC_PILCO_gym(MC_PILCO):
         self.validation_initial_state_history = []
         self.validation_policy_history = []
         self.validation_trial_index_history = []
+        self.validation_total_cost_history = []
+        self.best_validation_cost = None
+        self.best_validation_policy_state = None
+        self.best_validation_policy_meta = None
         if self.log_path is not None:
             self.log_dict["validation_config"] = self._validation_config_dict()
 
@@ -103,6 +109,33 @@ class MC_PILCO_gym(MC_PILCO):
             "validation_noise_seed": self.validation_noise_seed,
             "fixed_initial_state": self.validation_initial_state,
         }
+
+    def _compute_validation_total_cost(self, noiseless_states, input_samples, trial_index):
+        if noiseless_states is None or input_samples is None:
+            return None
+        try:
+            import torch
+
+            states_torch = torch.tensor(noiseless_states, dtype=self.dtype, device=self.device).unsqueeze(1)
+            inputs_torch = torch.tensor(input_samples, dtype=self.dtype, device=self.device).unsqueeze(1)
+            with torch.no_grad():
+                total_cost, _ = self.cost_function(states_torch, inputs_torch, trial_index=trial_index)
+            return float(total_cost.detach().cpu().item())
+        except Exception:
+            return None
+
+    def _update_best_validation_policy(self, policy_name, trial_index, validation_total_cost):
+        if policy_name != "control" or validation_total_cost is None:
+            return
+        if self.best_validation_cost is None or validation_total_cost < self.best_validation_cost:
+            self.best_validation_cost = float(validation_total_cost)
+            self.best_validation_policy_state = copy.deepcopy(self.control_policy.state_dict())
+            self.best_validation_policy_meta = {
+                "trial_index": int(trial_index),
+                "policy_name": str(policy_name),
+                "validation_total_cost": float(validation_total_cost),
+                "history_index": len(self.validation_total_cost_history) - 1,
+            }
 
     def _build_training_reset_kwargs(self, trial_index, road_profile=None):
         reset_kwargs = {}
@@ -170,6 +203,9 @@ class MC_PILCO_gym(MC_PILCO):
         self.validation_initial_state_history.append(validation_initial_state)
         self.validation_policy_history.append(policy_name)
         self.validation_trial_index_history.append(trial_index)
+        validation_total_cost = self._compute_validation_total_cost(noiseless_samples, input_samples, trial_index)
+        self.validation_total_cost_history.append(validation_total_cost)
+        self._update_best_validation_policy(policy_name, trial_index, validation_total_cost)
 
         if self.log_path is not None:
             self._write_validation_log()
@@ -184,6 +220,20 @@ class MC_PILCO_gym(MC_PILCO):
         self.log_dict["validation_initial_state_history"] = self.validation_initial_state_history
         self.log_dict["validation_policy_history"] = self.validation_policy_history
         self.log_dict["validation_trial_index_history"] = self.validation_trial_index_history
+        self.log_dict["validation_total_cost_history"] = self.validation_total_cost_history
+        self.log_dict["best_validation_cost"] = self.best_validation_cost
+        self.log_dict["best_validation_policy_meta"] = self.best_validation_policy_meta
+        if self.best_validation_policy_state is not None:
+            self.log_dict["best_validation_policy_state_dict"] = self.best_validation_policy_state
+
+    def finalize_best_validation_policy(self):
+        if self.best_validation_policy_state is None:
+            return
+        self.control_policy.load_state_dict(self.best_validation_policy_state)
+        if self.log_path is not None:
+            self.log_dict["selected_policy_source"] = "best_validation_control_policy"
+            self.log_dict["selected_policy_meta"] = self.best_validation_policy_meta
+            self._write_validation_log()
 
     def get_data_from_system(self, initial_state, T_exploration, trial_index, flg_exploration=False, road_profile=None):
         """

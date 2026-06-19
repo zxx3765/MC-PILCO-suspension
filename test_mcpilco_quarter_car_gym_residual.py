@@ -88,6 +88,11 @@ p.add_argument(
     action="store_true",
     help="Disable road-aware GP inputs. By default GP uses [z_r, z_r_dot] from Gym info; policy still does not.",
 )
+p.add_argument(
+    "-enable_road_preview_policy",
+    action="store_true",
+    help="Augment the control policy input with current [z_r, z_r_dot] road preview features.",
+)
 p.add_argument("-as_max", type=float, default=1.0, help="Sprung acceleration safety limit.")
 p.add_argument("-deflec_max", type=float, default=0.04, help="Suspension deflection safety limit.")
 p.add_argument("-punish_Q_acc_s", type=float, default=10.0, help="Reward weight for sprung acceleration.")
@@ -120,6 +125,7 @@ p.add_argument("-num_threads", type=int, default=4, help="Number of CPU threads 
 locals().update(vars(p.parse_known_args()[0]))
 
 use_road_gp_input = not disable_road_gp_input
+enable_road_preview_policy = enable_road_preview_policy and use_road_gp_input
 if validation_road_seed is None:
     validation_road_seed = road_seed + 1000000
 if validation_G0 is None:
@@ -278,14 +284,21 @@ rand_exploration_policy_par["dtype"] = dtype
 rand_exploration_policy_par["device"] = device
 
 print("\n---- 设置控制策略参数 ----")
-f_control_policy = Policy.Sum_of_gaussians
+if enable_road_preview_policy:
+    f_control_policy = Policy.Sum_of_gaussians_with_exogenous
+else:
+    f_control_policy = Policy.Sum_of_gaussians
 control_policy_par = {}
 control_policy_par["state_dim"] = state_dim
 control_policy_par["input_dim"] = input_dim
+if enable_road_preview_policy:
+    control_policy_par["exogenous_dim"] = road_gp_input_dim
 control_policy_par["num_basis"] = num_basis
 control_policy_par["flg_squash"] = True
 control_policy_par["u_max"] = u_max
 control_policy_par["weight_init"] = u_max * (np.random.rand(input_dim, control_policy_par["num_basis"]) - 0.5)
+if enable_road_preview_policy:
+    control_policy_par["scale_factor"] = np.array(env_config["obs_scaling"] + [0.01, 0.5], dtype=float)
 control_policy_par["dtype"] = dtype
 control_policy_par["device"] = device
 
@@ -336,6 +349,8 @@ resolved_run_name = (
 )
 if run_name is None and use_road_gp_input:
     resolved_run_name = safe_path_name(resolved_run_name + "_roadgp")
+if run_name is None and enable_road_preview_policy:
+    resolved_run_name = safe_path_name(resolved_run_name + "_roadpreview")
 resolved_run_name = append_suffix_once(resolved_run_name, "_residual")
 log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name)
 if os.path.isdir(log_path) and os.listdir(log_path) and not overwrite_existing:
@@ -368,6 +383,7 @@ experiment_info = {
         "cost_l3": cost_l3,
         "use_road_gp_input": use_road_gp_input,
         "road_gp_input_dim": road_gp_input_dim,
+        "enable_road_preview_policy": enable_road_preview_policy,
         "enable_validation_rollout": not disable_validation_rollout,
         "validation_road_seed": validation_road_seed,
         "validation_G0": validation_G0,
@@ -417,6 +433,7 @@ MC_PILCO_init_dict["input_dim"] = input_dim
 MC_PILCO_init_dict["gym_env"] = str(type(gym_env))
 MC_PILCO_init_dict["use_road_gp_input"] = use_road_gp_input
 MC_PILCO_init_dict["road_gp_input_dim"] = road_gp_input_dim
+MC_PILCO_init_dict["enable_road_preview_policy"] = enable_road_preview_policy
 MC_PILCO_init_dict["enable_validation_rollout"] = not disable_validation_rollout
 MC_PILCO_init_dict["validation_road_seed"] = validation_road_seed
 MC_PILCO_init_dict["validation_G0"] = validation_G0

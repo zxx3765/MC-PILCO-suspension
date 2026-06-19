@@ -32,14 +32,18 @@ class Policy(torch.nn.Module):
             # assign the identity function
             self.f_squash = lambda x: x
 
-    def forward(self, states, t=None, p_dropout=0.0):
+    def forward(self, states, t=None, p_dropout=0.0, exogenous_input=None):
         raise NotImplementedError()
 
-    def forward_np(self, state, t=None):
+    def forward_np(self, state, t=None, exogenous_input=None):
         """
         Numpy implementation of the policy
         """
-        input_tc = self(states=torch.tensor(state, dtype=self.dtype, device=self.device), t=t)
+        state_tc = torch.tensor(state, dtype=self.dtype, device=self.device)
+        exogenous_tc = None
+        if exogenous_input is not None:
+            exogenous_tc = torch.tensor(exogenous_input, dtype=self.dtype, device=self.device)
+        input_tc = self(states=state_tc, t=t, exogenous_input=exogenous_tc)
         return input_tc.detach().cpu().numpy()
 
     def to(self, device):
@@ -63,7 +67,7 @@ class Policy(torch.nn.Module):
         """
         Returns a function handle to the numpy version of the policy
         """
-        f = lambda state, t: self.forward_np(state, t)
+        f = lambda state, t, exogenous_input=None: self.forward_np(state, t, exogenous_input)
 
         return f
 
@@ -85,7 +89,7 @@ class Random_exploration(Policy):
         )
         self.u_max = u_max
 
-    def forward(self, states, t):
+    def forward(self, states, t=None, p_dropout=0.0, exogenous_input=None):
         # returns random control action
         rand_u = self.u_max * (2 * np.random.rand(self.input_dim) - 1).reshape([-1, self.input_dim])
         return torch.tensor(rand_u, dtype=self.dtype, device=self.device)
@@ -143,7 +147,7 @@ class Sum_of_sinusoids(Policy):
             requires_grad=False,
         )
 
-    def forward(self, states, t):
+    def forward(self, states, t=None, p_dropout=0.0, exogenous_input=None):
         # returns the sinusoid values at time t
         return self.f_squash(
             torch.sum(self.amplitudes * (torch.sin(self.omega * t + self.phases)), dim=0).reshape([-1, self.input_dim])
@@ -239,7 +243,7 @@ class Sum_of_gaussians(Policy):
             torch.rand(self.input_dim, self.num_basis, dtype=self.dtype, device=self.device) - 0.5
         )
 
-    def forward(self, states, t=None, p_dropout=0.0):
+    def forward(self, states, t=None, p_dropout=0.0, exogenous_input=None):
         """
         Returns a linear combination of gaussian functions
         with input given by the the distances between that state
@@ -263,6 +267,31 @@ class Sum_of_gaussians(Policy):
 
         # returns the constrained control action
         return self.f_squash(inputs)
+
+
+class Sum_of_gaussians_with_exogenous(Sum_of_gaussians):
+    """
+    Gaussian policy with an additional exogenous input channel, e.g. road preview.
+    """
+
+    def __init__(self, state_dim, input_dim, exogenous_dim, **kwargs):
+        self.observed_state_dim = state_dim
+        self.exogenous_dim = exogenous_dim
+        super(Sum_of_gaussians_with_exogenous, self).__init__(
+            state_dim=state_dim + exogenous_dim,
+            input_dim=input_dim,
+            **kwargs,
+        )
+
+    def forward(self, states, t=None, p_dropout=0.0, exogenous_input=None):
+        if exogenous_input is None:
+            raise ValueError("Exogenous policy input is required but missing.")
+        states = states.reshape([-1, self.observed_state_dim])
+        exogenous_input = exogenous_input.reshape([-1, self.exogenous_dim])
+        augmented_states = torch.cat([states, exogenous_input], dim=1)
+        return super(Sum_of_gaussians_with_exogenous, self).forward(
+            augmented_states, t=t, p_dropout=p_dropout, exogenous_input=None
+        )
 
 
 class Sum_of_gaussians_with_angles(Sum_of_gaussians):
