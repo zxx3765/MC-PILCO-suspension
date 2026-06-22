@@ -293,19 +293,42 @@ def extract_cost_parameters(cost_function, cost_function_par, config_log_dict):
         "w_acc": 0.4,
         "w_tire": 0.4,
         "w_barrier": 0.2,
+        "w_force": 0.0,
         "l_acc": 1.5,
         "l_tire": 0.006,
         "d_barrier": 0.035,
         "beta": 150.0,
+        "cost_mode": "legacy",
+        "tire_safe": 0.0024,
+        "d_safe": 0.012,
+        "force_scale": 250.0,
+        "tire_mode": "exp",
+        "travel_mode": "sigmoid",
     }
 
+    string_keys = {"cost_mode", "tire_mode", "travel_mode"}
     if hasattr(cost_function, "w_acc"):
         for name in params:
             attr_name = "d_barrier" if name == "d_barrier" else name
-            params[name] = float(getattr(cost_function, attr_name, params[name]))
+            value = getattr(cost_function, attr_name, params[name])
+            params[name] = str(value) if name in string_keys else float(value)
         return params
 
     key_params = config_log_dict.get("experiment_info", {}).get("key_parameters", {})
+    for key in [
+        "w_acc",
+        "w_tire",
+        "w_barrier",
+        "w_force",
+        "cost_mode",
+        "tire_safe",
+        "d_safe",
+        "force_scale",
+        "tire_cost_mode",
+        "travel_cost_mode",
+    ]:
+        if key in key_params:
+            params[key.replace("tire_cost_mode", "tire_mode").replace("travel_cost_mode", "travel_mode")] = key_params[key]
     if "cost_l0" in key_params:
         params["l_acc"] = float(key_params["cost_l0"])
     if "cost_l2" in key_params:
@@ -326,15 +349,29 @@ def extract_cost_parameters(cost_function, cost_function_par, config_log_dict):
     return params
 
 
-def compute_evaluation_costs(sprung_accel, suspension_travel, tire_deflection, params):
+def compute_evaluation_costs(sprung_accel, suspension_travel, tire_deflection, control_force, params):
     c_acc = 1.0 - np.exp(-((sprung_accel / params["l_acc"]) ** 2))
-    c_tire = 1.0 - np.exp(-((tire_deflection / params["l_tire"]) ** 2))
-    c_barrier = 1.0 / (1.0 + np.exp(-params["beta"] * (np.abs(suspension_travel) - params["d_barrier"])))
+    if params.get("cost_mode", "legacy") == "comfort_guard":
+        if params.get("tire_mode", "exp") == "hinge":
+            c_tire = np.maximum(0.0, np.abs(tire_deflection) - params["tire_safe"]) ** 2
+        else:
+            c_tire = 1.0 - np.exp(-((tire_deflection / params["l_tire"]) ** 2))
+
+        if params.get("travel_mode", "hinge") == "softplus":
+            c_barrier = np.log1p(np.exp(params["beta"] * (np.abs(suspension_travel) - params["d_safe"]))) / params["beta"]
+        else:
+            c_barrier = np.maximum(0.0, np.abs(suspension_travel) - params["d_safe"]) ** 2
+        c_force = (control_force / params["force_scale"]) ** 2
+    else:
+        c_tire = 1.0 - np.exp(-((tire_deflection / params["l_tire"]) ** 2))
+        c_barrier = 1.0 / (1.0 + np.exp(-params["beta"] * (np.abs(suspension_travel) - params["d_barrier"])))
+        c_force = np.zeros_like(c_acc)
 
     cost_comfort = params["w_acc"] * c_acc
     cost_road_holding = params["w_tire"] * c_tire
     cost_safety = params["w_barrier"] * c_barrier
-    return cost_comfort, cost_road_holding, cost_safety, cost_comfort + cost_road_holding + cost_safety
+    cost_force = params["w_force"] * c_force
+    return cost_comfort, cost_road_holding, cost_safety, cost_force, cost_comfort + cost_road_holding + cost_safety + cost_force
 
 
 def instantaneous_cost(cost_function, state_samples, input_samples, dtype, device, trial_index):
@@ -362,6 +399,7 @@ def plot_validation_response(
     cost_comfort,
     cost_road_holding,
     cost_safety,
+    cost_force,
     passive_sprung_accel,
     passive_suspension_travel,
     passive_tire_deflection,
@@ -369,6 +407,7 @@ def plot_validation_response(
     passive_cost_comfort,
     passive_cost_road_holding,
     passive_cost_safety,
+    passive_cost_force,
     reward,
     T_sampling,
 ):
@@ -472,15 +511,17 @@ def plot_validation_response(
     axes[6].plot(time, cost_comfort, color="#1f77b4", linewidth=1.3, label="comfort")
     axes[6].plot(time, cost_road_holding, color="#d62728", linewidth=1.3, label="road holding")
     axes[6].plot(time, cost_safety, color="#2ca02c", linewidth=1.3, label="safety")
+    axes[6].plot(time, cost_force, color="#ff7f0e", linewidth=1.2, label="force")
     if passive_cost_total is not None:
         axes[6].plot(time, passive_cost_comfort, color="#1f77b4", linestyle=":", linewidth=1.0, alpha=0.5)
         axes[6].plot(time, passive_cost_road_holding, color="#d62728", linestyle=":", linewidth=1.0, alpha=0.5)
         axes[6].plot(time, passive_cost_safety, color="#2ca02c", linestyle=":", linewidth=1.0, alpha=0.5)
+        axes[6].plot(time, passive_cost_force, color="#ff7f0e", linestyle=":", linewidth=1.0, alpha=0.5)
     axes[6].axhline(y=0, color="0.15", linestyle="--", linewidth=0.8, alpha=0.35)
     axes[6].grid(True, alpha=0.28)
     axes[6].set_ylabel("cost")
     axes[6].set_title("Component evaluation costs", loc="left", fontsize=10)
-    axes[6].legend(loc="upper right", frameon=False, ncol=3, fontsize=8.5)
+    axes[6].legend(loc="upper right", frameon=False, ncol=4, fontsize=8.5)
 
     cumulative_reward = np.cumsum(reward) * T_sampling
     axes[7].plot(time, reward, color="#2ca02c", linewidth=1.4, label="instant reward")
@@ -801,23 +842,29 @@ def main():
         cost = instantaneous_cost(cost_function, state_samples, input_samples, dtype, device, cost_trial_index)
         reward = -as_1d_array(cost)
 
-        cost_comfort, cost_road_holding, cost_safety, cost_total = compute_evaluation_costs(
-            sprung_accel, suspension_travel, tire_deflection, cost_params
+        cost_comfort, cost_road_holding, cost_safety, cost_force, cost_total = compute_evaluation_costs(
+            sprung_accel, suspension_travel, tire_deflection, control_force, cost_params
         )
         if passive_sprung_accel is not None:
             (
                 passive_cost_comfort,
                 passive_cost_road_holding,
                 passive_cost_safety,
+                passive_cost_force,
                 passive_cost_total,
             ) = compute_evaluation_costs(
-                passive_sprung_accel, passive_suspension_travel, passive_tire_deflection, cost_params
+                passive_sprung_accel,
+                passive_suspension_travel,
+                passive_tire_deflection,
+                np.zeros_like(passive_sprung_accel),
+                cost_params,
             )
         else:
             passive_cost_total = None
             passive_cost_comfort = None
             passive_cost_road_holding = None
             passive_cost_safety = None
+            passive_cost_force = None
 
         plot_validation_response(
             result_file,
@@ -834,6 +881,7 @@ def main():
             cost_comfort,
             cost_road_holding,
             cost_safety,
+            cost_force,
             passive_sprung_accel,
             passive_suspension_travel,
             passive_tire_deflection,
@@ -841,6 +889,7 @@ def main():
             passive_cost_comfort,
             passive_cost_road_holding,
             passive_cost_safety,
+            passive_cost_force,
             reward,
             T_sampling,
         )
@@ -853,6 +902,10 @@ def main():
             "rms_tire_deflection": root_mean_square(tire_deflection),
             "rms_control_force": root_mean_square(control_force),
             "mean_evaluation_cost": float(np.mean(cost_total)),
+            "mean_cost_comfort": float(np.mean(cost_comfort)),
+            "mean_cost_tire": float(np.mean(cost_road_holding)),
+            "mean_cost_safety": float(np.mean(cost_safety)),
+            "mean_cost_force": float(np.mean(cost_force)),
         }
         metric_rows.append(metrics)
         rms_sprung_accel.append(metrics["rms_sprung_accel"])

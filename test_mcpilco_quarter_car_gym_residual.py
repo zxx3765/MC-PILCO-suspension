@@ -81,6 +81,13 @@ p.add_argument(
 )
 p.add_argument("-validation_G0", type=float, default=None, help="Fixed validation G0. Defaults to G0.")
 p.add_argument("-disable_validation_rollout", action="store_true", help="Disable fixed-road validation rollouts.")
+p.add_argument(
+    "-validation_selection",
+    choices=["total_cost", "feasible_comfort"],
+    default="total_cost",
+    help="Checkpoint rule: mixed total cost, or travel-feasible comfort-first selection.",
+)
+p.add_argument("-validation_travel_limit", type=float, default=0.015, help="Absolute travel feasibility limit [m].")
 p.add_argument("-Road_Type", type=str, default="Random", choices=["Sine", "Chirp", "Random", "Bump"], help="Road type.")
 p.add_argument("-road_velocity", type=float, default=20.0, help="Road velocity parameter.")
 p.add_argument(
@@ -92,6 +99,49 @@ p.add_argument(
     "-enable_road_preview_policy",
     action="store_true",
     help="Augment the control policy input with current [z_r, z_r_dot] road preview features.",
+)
+p.add_argument(
+    "-policy_structure",
+    type=str,
+    default="direct_force",
+    choices=["direct_force", "imp01_signed_k", "imp02_signed_kc"],
+    help="Control-policy output structure. imp01_signed_k uses F_active = -k_ctr * x_def; imp02_signed_kc uses F_active = -(k_ctr * x_def + c_ctr * v_def).",
+)
+p.add_argument(
+    "-k_ctr_max",
+    type=float,
+    default=50000.0,
+    help="Signed active virtual-stiffness limit [N/m] for -policy_structure imp01_signed_k.",
+)
+p.add_argument(
+    "-c_ctr_max",
+    type=float,
+    default=5000.0,
+    help="Signed active virtual-damping limit [N*s/m] for -policy_structure imp02_signed_kc.",
+)
+p.add_argument(
+    "-k_init_scale",
+    type=float,
+    default=1.0,
+    help="Multiplier on random virtual-stiffness weight initialization for impedance policies.",
+)
+p.add_argument(
+    "-c_init_scale",
+    type=float,
+    default=1.0,
+    help="Multiplier on random virtual-damping weight initialization for impedance policies.",
+)
+p.add_argument(
+    "-k_bias_init",
+    type=float,
+    default=0.0,
+    help="Initial bias for signed virtual-stiffness output [N/m].",
+)
+p.add_argument(
+    "-c_bias_init",
+    type=float,
+    default=0.0,
+    help="Initial bias for signed virtual-damping output [N*s/m].",
 )
 p.add_argument("-as_max", type=float, default=1.0, help="Sprung acceleration safety limit.")
 p.add_argument("-deflec_max", type=float, default=0.04, help="Suspension deflection safety limit.")
@@ -114,10 +164,35 @@ p.add_argument(
 p.add_argument("-w_acc", type=float, default=0.4, help="Comfort weight.")
 p.add_argument("-w_tire", type=float, default=0.4, help="Road holding weight.")
 p.add_argument("-w_barrier", type=float, default=0.2, help="Safety barrier weight.")
+p.add_argument(
+    "-cost_mode",
+    type=str,
+    default="legacy",
+    choices=["legacy", "comfort_guard"],
+    help="Suspension cost mode: legacy mixed objective or comfort-first guard formulation.",
+)
 p.add_argument("-l_acc", type=float, default=1.5, help="Comfort acceleration scale.")
 p.add_argument("-l_tire", type=float, default=0.006, help="Tire deflection scale.")
 p.add_argument("-d_barrier", type=float, default=0.035, help="Safety barrier displacement threshold.")
 p.add_argument("-beta_barrier", type=float, default=150.0, help="Safety barrier steepness coefficient.")
+p.add_argument("-tire_safe", type=float, default=0.0024, help="Tire guard threshold [m].")
+p.add_argument("-d_safe", type=float, default=0.012, help="Travel guard activation threshold [m].")
+p.add_argument("-w_force", type=float, default=0.0, help="Control effort regularization weight.")
+p.add_argument("-force_scale", type=float, default=250.0, help="Force scale [N] used by effort regularization.")
+p.add_argument(
+    "-tire_cost_mode",
+    type=str,
+    default="exp",
+    choices=["exp", "hinge"],
+    help="Tire cost form for comfort_guard mode.",
+)
+p.add_argument(
+    "-travel_cost_mode",
+    type=str,
+    default="sigmoid",
+    choices=["sigmoid", "softplus", "hinge"],
+    help="Travel cost form. comfort_guard uses softplus or hinge; legacy ignores non-sigmoid options.",
+)
 p.add_argument(
     "-device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Computation device (cpu or cuda)"
 )
@@ -284,21 +359,56 @@ rand_exploration_policy_par["dtype"] = dtype
 rand_exploration_policy_par["device"] = device
 
 print("\n---- 设置控制策略参数 ----")
-if enable_road_preview_policy:
+if policy_structure == "imp01_signed_k":
+    f_control_policy = Policy.Virtual_stiffness_sum_of_gaussians
+elif policy_structure == "imp02_signed_kc":
+    f_control_policy = Policy.Virtual_impedance_kc_sum_of_gaussians
+elif enable_road_preview_policy:
     f_control_policy = Policy.Sum_of_gaussians_with_exogenous
 else:
     f_control_policy = Policy.Sum_of_gaussians
 control_policy_par = {}
 control_policy_par["state_dim"] = state_dim
 control_policy_par["input_dim"] = input_dim
-if enable_road_preview_policy:
+if enable_road_preview_policy or policy_structure in ["imp01_signed_k", "imp02_signed_kc"]:
     control_policy_par["exogenous_dim"] = road_gp_input_dim
 control_policy_par["num_basis"] = num_basis
 control_policy_par["flg_squash"] = True
 control_policy_par["u_max"] = u_max
-control_policy_par["weight_init"] = u_max * (np.random.rand(input_dim, control_policy_par["num_basis"]) - 0.5)
-if enable_road_preview_policy:
-    control_policy_par["scale_factor"] = np.array(env_config["obs_scaling"] + [0.01, 0.5], dtype=float)
+if policy_structure == "imp01_signed_k":
+    control_policy_par["weight_init"] = (
+        k_init_scale * k_ctr_max * (np.random.rand(input_dim, control_policy_par["num_basis"]) - 0.5)
+    )
+    control_policy_par["k_max"] = k_ctr_max
+    control_policy_par["act_scaling"] = env_config["act_scaling"]
+    control_policy_par["x_def_index"] = 3
+    control_policy_par["obs_scaling"] = env_config["obs_scaling"]
+    control_policy_par["flg_bias"] = True
+    control_policy_par["flg_train_bias"] = True
+    control_policy_par["bias_init"] = np.array([k_bias_init], dtype=float)
+elif policy_structure == "imp02_signed_kc":
+    control_policy_par["weight_init"] = np.vstack(
+        [
+            k_init_scale * k_ctr_max * (np.random.rand(1, control_policy_par["num_basis"]) - 0.5),
+            c_init_scale * c_ctr_max * (np.random.rand(1, control_policy_par["num_basis"]) - 0.5),
+        ]
+    )
+    control_policy_par["k_max"] = k_ctr_max
+    control_policy_par["c_max"] = c_ctr_max
+    control_policy_par["act_scaling"] = env_config["act_scaling"]
+    control_policy_par["x_def_index"] = 3
+    control_policy_par["v_def_index"] = 4
+    control_policy_par["obs_scaling"] = env_config["obs_scaling"]
+    control_policy_par["flg_bias"] = True
+    control_policy_par["flg_train_bias"] = True
+    control_policy_par["bias_init"] = np.array([k_bias_init, c_bias_init], dtype=float)
+else:
+    control_policy_par["weight_init"] = u_max * (np.random.rand(input_dim, control_policy_par["num_basis"]) - 0.5)
+if enable_road_preview_policy or policy_structure in ["imp01_signed_k", "imp02_signed_kc"]:
+    policy_scale_factor = list(env_config["obs_scaling"])
+    if road_gp_input_dim > 0:
+        policy_scale_factor += [0.01, 0.5]
+    control_policy_par["scale_factor"] = np.array(policy_scale_factor, dtype=float)
 control_policy_par["dtype"] = dtype
 control_policy_par["device"] = device
 
@@ -314,6 +424,13 @@ if use_suspension_cost:
         "d_barrier": d_barrier,
         "beta": beta_barrier,
         "obs_scaling": env_config["obs_scaling"],
+        "cost_mode": cost_mode,
+        "tire_safe": tire_safe,
+        "d_safe": d_safe,
+        "w_force": w_force,
+        "force_scale": force_scale,
+        "tire_mode": tire_cost_mode,
+        "travel_mode": "sigmoid" if cost_mode == "legacy" else travel_cost_mode,
     }
 else:
     f_cost_function = Cost_function.Expected_saturated_distance
@@ -351,10 +468,14 @@ if run_name is None and use_road_gp_input:
     resolved_run_name = safe_path_name(resolved_run_name + "_roadgp")
 if run_name is None and enable_road_preview_policy:
     resolved_run_name = safe_path_name(resolved_run_name + "_roadpreview")
+if run_name is None and policy_structure != "direct_force":
+    resolved_run_name = safe_path_name(resolved_run_name + "_" + policy_structure)
 resolved_run_name = append_suffix_once(resolved_run_name, "_residual")
 log_path = os.path.join(result_root, "seed_" + str(seed), resolved_run_name)
 if os.path.isdir(log_path) and os.listdir(log_path) and not overwrite_existing:
-    raise FileExistsError("结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path))
+    raise FileExistsError(
+        "结果目录已存在且非空: {}。请使用新的 -run_name，或确认后添加 -overwrite_existing。".format(log_path)
+    )
 os.makedirs(log_path, exist_ok=True)
 experiment_info = {
     "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -384,17 +505,44 @@ experiment_info = {
         "use_road_gp_input": use_road_gp_input,
         "road_gp_input_dim": road_gp_input_dim,
         "enable_road_preview_policy": enable_road_preview_policy,
+        "policy_structure": policy_structure,
+        "virtual_impedance_force_form": (
+            "F_active = -k_ctr * x_def"
+            if policy_structure == "imp01_signed_k"
+            else "F_active = -(k_ctr * x_def + c_ctr * v_def)"
+            if policy_structure == "imp02_signed_kc"
+            else None
+        ),
+        "k_ctr_signed": policy_structure in ["imp01_signed_k", "imp02_signed_kc"],
+        "c_ctr_signed": policy_structure == "imp02_signed_kc",
+        "k_ctr_max": k_ctr_max if policy_structure in ["imp01_signed_k", "imp02_signed_kc"] else None,
+        "c_ctr_max": c_ctr_max if policy_structure == "imp02_signed_kc" else None,
+        "k_init_scale": k_init_scale if policy_structure in ["imp01_signed_k", "imp02_signed_kc"] else None,
+        "c_init_scale": c_init_scale if policy_structure == "imp02_signed_kc" else None,
+        "k_bias_init": k_bias_init if policy_structure in ["imp01_signed_k", "imp02_signed_kc"] else None,
+        "c_bias_init": c_bias_init if policy_structure == "imp02_signed_kc" else None,
+        "x_def_index": 3 if policy_structure in ["imp01_signed_k", "imp02_signed_kc"] else None,
+        "v_def_index": 4 if policy_structure == "imp02_signed_kc" else None,
         "enable_validation_rollout": not disable_validation_rollout,
         "validation_road_seed": validation_road_seed,
         "validation_G0": validation_G0,
+        "validation_selection": validation_selection,
+        "validation_travel_limit": validation_travel_limit,
         "use_suspension_cost": use_suspension_cost,
         "w_acc": w_acc,
         "w_tire": w_tire,
         "w_barrier": w_barrier,
+        "cost_mode": cost_mode,
         "l_acc": l_acc,
         "l_tire": l_tire,
         "d_barrier": d_barrier,
         "beta_barrier": beta_barrier,
+        "tire_safe": tire_safe,
+        "d_safe": d_safe,
+        "w_force": w_force,
+        "force_scale": force_scale,
+        "tire_cost_mode": tire_cost_mode,
+        "travel_cost_mode": "sigmoid" if cost_mode == "legacy" else travel_cost_mode,
     },
 }
 print("结果目录:", log_path)
@@ -423,6 +571,8 @@ mc_pilco = MC_PILCO_gym.MC_PILCO_gym(
     validation_road_seed=validation_road_seed,
     validation_G0=validation_G0,
     validation_initial_state=initial_state,
+    validation_selection=validation_selection,
+    validation_travel_limit=validation_travel_limit,
 )
 
 print("\n---- 保存测试配置 ----")
@@ -434,6 +584,14 @@ MC_PILCO_init_dict["gym_env"] = str(type(gym_env))
 MC_PILCO_init_dict["use_road_gp_input"] = use_road_gp_input
 MC_PILCO_init_dict["road_gp_input_dim"] = road_gp_input_dim
 MC_PILCO_init_dict["enable_road_preview_policy"] = enable_road_preview_policy
+MC_PILCO_init_dict["policy_structure"] = policy_structure
+MC_PILCO_init_dict["virtual_impedance_force_form"] = (
+    "F_active = -k_ctr * x_def"
+    if policy_structure == "imp01_signed_k"
+    else "F_active = -(k_ctr * x_def + c_ctr * v_def)"
+    if policy_structure == "imp02_signed_kc"
+    else None
+)
 MC_PILCO_init_dict["enable_validation_rollout"] = not disable_validation_rollout
 MC_PILCO_init_dict["validation_road_seed"] = validation_road_seed
 MC_PILCO_init_dict["validation_G0"] = validation_G0

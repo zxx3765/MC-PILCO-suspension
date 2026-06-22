@@ -46,6 +46,7 @@ If active control is worse than passive, prioritize these questions:
    - Comfort: sprung-mass acceleration.
    - Road holding: tire deflection.
    - Safety: suspension travel / hard or soft barrier.
+   - Treat suspension travel as a constraint, not a minimization objective: the goal is to avoid bump-stop/rebound-stop contact and retain an adequate safety margin. Once the travel stays inside the allowed range, a smaller travel RMS is not inherently better and should not be traded against comfort or road holding merely to reduce RMS.
    - Optional control effort penalty, if present.
    - Check component costs, not only total cost.
 
@@ -202,7 +203,8 @@ Use `repeat_test.py` or the tuning scripts when statistical comparison across se
 When investigating bad performance, collect or compute:
 
 - Active vs passive trajectories on the same validation road.
-- RMS and peak values for sprung acceleration, suspension travel, tire deflection, and control force.
+- RMS and peak values for sprung acceleration, tire deflection, and control force.
+- For suspension travel, prioritize maximum/minimum travel, distance to the compression/rebound limits, limit-hit count/rate, and barrier violations. Travel RMS may be logged for continuity, but must not be used as a primary optimization or ranking metric when no limit is approached.
 - Cost component curves and cumulative cost.
 - Policy input/output ranges and actuator saturation rate.
 - One-step GP prediction error.

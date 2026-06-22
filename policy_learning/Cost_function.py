@@ -184,11 +184,31 @@ def cart_pole_cost(states_sequence, inputs_sequence, trial_index, target_state, 
 
 class Expected_suspension_evaluation_cost(Expected_cost):
     """
-    Cost function designed for real-world suspension evaluation criteria.
-    It penalizes sprung mass acceleration, tire deflection, and enforces a safety barrier on suspension travel.
+    Cost function designed for quarter-car suspension evaluation.
+
+    Two modes are supported:
+    - "legacy": comfort + tire exponential + always-on travel sigmoid barrier
+    - "comfort_guard": comfort-dominant cost with thresholded tire/travel guards and weak force regularization
     """
 
-    def __init__(self, w_acc, w_tire, w_barrier, l_acc, l_tire, d_barrier, beta, obs_scaling):
+    def __init__(
+        self,
+        w_acc,
+        w_tire,
+        w_barrier,
+        l_acc,
+        l_tire,
+        d_barrier,
+        beta,
+        obs_scaling,
+        cost_mode="legacy",
+        tire_safe=None,
+        d_safe=None,
+        w_force=0.0,
+        force_scale=250.0,
+        tire_mode="exp",
+        travel_mode="sigmoid",
+    ):
         self.w_acc = w_acc
         self.w_tire = w_tire
         self.w_barrier = w_barrier
@@ -197,6 +217,13 @@ class Expected_suspension_evaluation_cost(Expected_cost):
         self.d_barrier = d_barrier
         self.beta = beta
         self.obs_scaling = obs_scaling
+        self.cost_mode = cost_mode
+        self.tire_safe = l_tire if tire_safe is None else tire_safe
+        self.d_safe = d_barrier if d_safe is None else d_safe
+        self.w_force = w_force
+        self.force_scale = force_scale
+        self.tire_mode = tire_mode
+        self.travel_mode = travel_mode
 
         f_cost = lambda x, u, trial_index: suspension_evaluation_cost(
             x,
@@ -210,15 +237,39 @@ class Expected_suspension_evaluation_cost(Expected_cost):
             d_barrier=d_barrier,
             beta=beta,
             obs_scaling=obs_scaling,
+            cost_mode=cost_mode,
+            tire_safe=self.tire_safe,
+            d_safe=self.d_safe,
+            w_force=w_force,
+            force_scale=force_scale,
+            tire_mode=tire_mode,
+            travel_mode=travel_mode,
         )
         super(Expected_suspension_evaluation_cost, self).__init__(f_cost)
 
 
 def suspension_evaluation_cost(
-    states_sequence, inputs_sequence, trial_index, w_acc, w_tire, w_barrier, l_acc, l_tire, d_barrier, beta, obs_scaling
+    states_sequence,
+    inputs_sequence,
+    trial_index,
+    w_acc,
+    w_tire,
+    w_barrier,
+    l_acc,
+    l_tire,
+    d_barrier,
+    beta,
+    obs_scaling,
+    cost_mode="legacy",
+    tire_safe=None,
+    d_safe=None,
+    w_force=0.0,
+    force_scale=250.0,
+    tire_mode="exp",
+    travel_mode="sigmoid",
 ):
     """
-    Computes comfort, road holding, and safety barrier cost components.
+    Computes comfort, road holding, travel safety, and optional force regularization terms.
     """
     # obs_scaling = [5.0, 1.0, 0.03, 0.3]
     # states_sequence: [num_instants, num_particles, state_dim]
@@ -232,11 +283,28 @@ def suspension_evaluation_cost(
         tire = states_sequence[:, :, 3] * obs_scaling[3]
 
     c_acc = 1.0 - torch.exp(-((acc_s / l_acc) ** 2))
-    c_tire = 1.0 - torch.exp(-((tire / l_tire) ** 2))
 
-    # Sigmoid barrier for travel deflection
-    c_barrier = 1.0 / (1.0 + torch.exp(-beta * (torch.abs(travel) - d_barrier)))
+    if cost_mode == "comfort_guard":
+        tire_safe = l_tire if tire_safe is None else tire_safe
+        d_safe = d_barrier if d_safe is None else d_safe
 
-    total_cost = w_acc * c_acc + w_tire * c_tire + w_barrier * c_barrier
+        if tire_mode == "hinge":
+            c_tire = torch.clamp(torch.abs(tire) - tire_safe, min=0.0) ** 2
+        else:
+            c_tire = 1.0 - torch.exp(-((tire / l_tire) ** 2))
+
+        if travel_mode == "softplus":
+            c_barrier = torch.nn.functional.softplus(beta * (torch.abs(travel) - d_safe)) / beta
+        else:
+            c_barrier = torch.clamp(torch.abs(travel) - d_safe, min=0.0) ** 2
+
+        force = inputs_sequence[:, :, 0] / force_scale
+        c_force = force**2
+    else:
+        c_tire = 1.0 - torch.exp(-((tire / l_tire) ** 2))
+        c_barrier = 1.0 / (1.0 + torch.exp(-beta * (torch.abs(travel) - d_barrier)))
+        c_force = 0.0
+
+    total_cost = w_acc * c_acc + w_tire * c_tire + w_barrier * c_barrier + w_force * c_force
     return total_cost.unsqueeze(-1)
 

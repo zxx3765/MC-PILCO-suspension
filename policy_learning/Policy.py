@@ -294,6 +294,165 @@ class Sum_of_gaussians_with_exogenous(Sum_of_gaussians):
         )
 
 
+class Virtual_stiffness_sum_of_gaussians(Sum_of_gaussians):
+    """
+    Stage IMP-01 quarter-car policy.
+
+    The RBF policy outputs a signed active virtual stiffness k_ctr, then converts it to the
+    normalized Gym action through F_active = -k_ctr * x_def.
+    """
+
+    def __init__(
+        self,
+        state_dim,
+        input_dim,
+        num_basis,
+        k_max,
+        act_scaling,
+        x_def_index=3,
+        obs_scaling=None,
+        exogenous_dim=0,
+        flg_squash=True,
+        u_max=1,
+        **kwargs,
+    ):
+        if input_dim != 1:
+            raise ValueError("Virtual_stiffness_sum_of_gaussians currently supports one actuator input.")
+        self.observed_state_dim = state_dim
+        self.exogenous_dim = exogenous_dim
+        self.x_def_index = x_def_index
+        self.k_max = k_max
+        self.act_scaling = act_scaling
+        self.action_u_max = u_max
+        self.flg_action_squash = flg_squash
+        if obs_scaling is None:
+            obs_scaling = np.ones(state_dim)
+        self.obs_scaling_np = np.asarray(obs_scaling, dtype=float)
+        super(Virtual_stiffness_sum_of_gaussians, self).__init__(
+            state_dim=state_dim + exogenous_dim,
+            input_dim=input_dim,
+            num_basis=num_basis,
+            flg_squash=False,
+            u_max=u_max,
+            **kwargs,
+        )
+        self.obs_scaling = torch.tensor(self.obs_scaling_np, dtype=self.dtype, device=self.device).reshape([1, -1])
+
+    def to(self, device):
+        super(Virtual_stiffness_sum_of_gaussians, self).to(device)
+        self.obs_scaling = self.obs_scaling.to(device)
+
+    def _augment_policy_state(self, states, exogenous_input):
+        states = states.reshape([-1, self.observed_state_dim])
+        if self.exogenous_dim == 0:
+            return states
+        if exogenous_input is None:
+            raise ValueError("Exogenous policy input is required but missing.")
+        exogenous_input = exogenous_input.reshape([-1, self.exogenous_dim])
+        return torch.cat([states, exogenous_input], dim=1)
+
+    def forward(self, states, t=None, p_dropout=0.0, exogenous_input=None):
+        states = states.reshape([-1, self.observed_state_dim])
+        policy_states = self._augment_policy_state(states, exogenous_input)
+        raw_k = super(Virtual_stiffness_sum_of_gaussians, self).forward(
+            policy_states, t=t, p_dropout=p_dropout, exogenous_input=None
+        )
+        k_ctr = self.k_max * torch.tanh(raw_k / self.k_max)
+        x_def = (
+            states[:, self.x_def_index : self.x_def_index + 1]
+            * self.obs_scaling[:, self.x_def_index : self.x_def_index + 1]
+        )
+        physical_force = -k_ctr * x_def
+        normalized_action = physical_force * self.act_scaling
+        if self.flg_action_squash:
+            return self.squashing(normalized_action, self.action_u_max)
+        return normalized_action
+
+
+class Virtual_impedance_kc_sum_of_gaussians(Sum_of_gaussians):
+    """
+    Stage IMP-02 quarter-car policy.
+
+    The RBF policy outputs signed active virtual stiffness/damping terms, then converts them to the
+    normalized Gym action through F_active = -(k_ctr * x_def + c_ctr * v_def).
+    """
+
+    def __init__(
+        self,
+        state_dim,
+        input_dim,
+        num_basis,
+        k_max,
+        c_max,
+        act_scaling,
+        x_def_index=3,
+        v_def_index=4,
+        obs_scaling=None,
+        exogenous_dim=0,
+        flg_squash=True,
+        u_max=1,
+        **kwargs,
+    ):
+        if input_dim != 1:
+            raise ValueError("Virtual_impedance_kc_sum_of_gaussians currently supports one actuator input.")
+        self.observed_state_dim = state_dim
+        self.exogenous_dim = exogenous_dim
+        self.x_def_index = x_def_index
+        self.v_def_index = v_def_index
+        self.k_max = k_max
+        self.c_max = c_max
+        self.act_scaling = act_scaling
+        self.action_u_max = u_max
+        self.flg_action_squash = flg_squash
+        if obs_scaling is None:
+            obs_scaling = np.ones(state_dim)
+        self.obs_scaling_np = np.asarray(obs_scaling, dtype=float)
+        super(Virtual_impedance_kc_sum_of_gaussians, self).__init__(
+            state_dim=state_dim + exogenous_dim,
+            input_dim=2,
+            num_basis=num_basis,
+            flg_squash=False,
+            u_max=u_max,
+            **kwargs,
+        )
+        self.obs_scaling = torch.tensor(self.obs_scaling_np, dtype=self.dtype, device=self.device).reshape([1, -1])
+
+    def to(self, device):
+        super(Virtual_impedance_kc_sum_of_gaussians, self).to(device)
+        self.obs_scaling = self.obs_scaling.to(device)
+
+    def _augment_policy_state(self, states, exogenous_input):
+        states = states.reshape([-1, self.observed_state_dim])
+        if self.exogenous_dim == 0:
+            return states
+        if exogenous_input is None:
+            raise ValueError("Exogenous policy input is required but missing.")
+        exogenous_input = exogenous_input.reshape([-1, self.exogenous_dim])
+        return torch.cat([states, exogenous_input], dim=1)
+
+    def forward(self, states, t=None, p_dropout=0.0, exogenous_input=None):
+        states = states.reshape([-1, self.observed_state_dim])
+        policy_states = self._augment_policy_state(states, exogenous_input)
+        raw_kc = super(Virtual_impedance_kc_sum_of_gaussians, self).forward(
+            policy_states, t=t, p_dropout=p_dropout, exogenous_input=None
+        )
+        k_ctr = self.k_max * torch.tanh(raw_kc[:, 0:1] / self.k_max)
+        c_ctr = self.c_max * torch.tanh(raw_kc[:, 1:2] / self.c_max)
+        x_def = (
+            states[:, self.x_def_index : self.x_def_index + 1]
+            * self.obs_scaling[:, self.x_def_index : self.x_def_index + 1]
+        )
+        v_def = (
+            states[:, self.v_def_index : self.v_def_index + 1]
+            * self.obs_scaling[:, self.v_def_index : self.v_def_index + 1]
+        )
+        physical_force = -(k_ctr * x_def + c_ctr * v_def)
+        normalized_action = physical_force * self.act_scaling
+        if self.flg_action_squash:
+            return self.squashing(normalized_action, self.action_u_max)
+        return normalized_action
+
+
 class Sum_of_gaussians_with_angles(Sum_of_gaussians):
     """
     Extends sum of gaussians policy. Angle indices are mapped in cos and sin before computing the policy

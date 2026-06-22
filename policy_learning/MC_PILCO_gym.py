@@ -44,6 +44,8 @@ class MC_PILCO_gym(MC_PILCO):
         validation_G0=None,
         validation_noise_seed=None,
         validation_initial_state=None,
+        validation_selection="total_cost",
+        validation_travel_limit=0.015,
     ):
         """
         gym_env: gym environment instance (already created)
@@ -84,6 +86,8 @@ class MC_PILCO_gym(MC_PILCO):
         self.validation_initial_state = (
             None if validation_initial_state is None else np.asarray(validation_initial_state).copy()
         )
+        self.validation_selection = validation_selection
+        self.validation_travel_limit = float(validation_travel_limit)
         self.gym_reset_kwargs_history = []
         self.gym_initial_state_history = []
         self.validation_state_samples_history = []
@@ -95,6 +99,7 @@ class MC_PILCO_gym(MC_PILCO):
         self.validation_policy_history = []
         self.validation_trial_index_history = []
         self.validation_total_cost_history = []
+        self.validation_selection_metrics_history = []
         self.best_validation_cost = None
         self.best_validation_policy_state = None
         self.best_validation_policy_meta = None
@@ -108,6 +113,8 @@ class MC_PILCO_gym(MC_PILCO):
             "validation_G0": self.validation_G0,
             "validation_noise_seed": self.validation_noise_seed,
             "fixed_initial_state": self.validation_initial_state,
+            "selection": self.validation_selection,
+            "travel_limit": self.validation_travel_limit,
         }
 
     def _compute_validation_total_cost(self, noiseless_states, input_samples, trial_index):
@@ -124,16 +131,36 @@ class MC_PILCO_gym(MC_PILCO):
         except Exception:
             return None
 
-    def _update_best_validation_policy(self, policy_name, trial_index, validation_total_cost):
-        if policy_name != "control" or validation_total_cost is None:
+    def _validation_selection_metrics(self, noiseless_states, validation_total_cost):
+        states = np.asarray(noiseless_states)
+        obs_scaling = np.asarray(getattr(self.cost_function, "obs_scaling", np.ones(states.shape[-1])))
+        acc_index, travel_index = (0, 3) if states.shape[-1] == 5 else (0, 2)
+        acc = states[:, acc_index] * obs_scaling[acc_index]
+        travel = states[:, travel_index] * obs_scaling[travel_index]
+        return {
+            "validation_total_cost": float(validation_total_cost),
+            "rms_sprung_acceleration": float(np.sqrt(np.mean(np.square(acc)))),
+            "max_abs_suspension_travel": float(np.max(np.abs(travel))),
+            "travel_feasible": bool(np.max(np.abs(travel)) <= self.validation_travel_limit),
+        }
+
+    def _update_best_validation_policy(self, policy_name, trial_index, metrics):
+        if policy_name != "control" or metrics is None:
             return
-        if self.best_validation_cost is None or validation_total_cost < self.best_validation_cost:
-            self.best_validation_cost = float(validation_total_cost)
+        if self.validation_selection == "feasible_comfort":
+            candidate_key = (not metrics["travel_feasible"], metrics["rms_sprung_acceleration"], metrics["validation_total_cost"])
+            best_key = None if self.best_validation_policy_meta is None else self.best_validation_policy_meta["selection_key"]
+        else:
+            candidate_key = (metrics["validation_total_cost"],)
+            best_key = None if self.best_validation_policy_meta is None else self.best_validation_policy_meta["selection_key"]
+        if best_key is None or candidate_key < tuple(best_key):
+            self.best_validation_cost = metrics["validation_total_cost"]
             self.best_validation_policy_state = copy.deepcopy(self.control_policy.state_dict())
             self.best_validation_policy_meta = {
                 "trial_index": int(trial_index),
                 "policy_name": str(policy_name),
-                "validation_total_cost": float(validation_total_cost),
+                **metrics,
+                "selection_key": candidate_key,
                 "history_index": len(self.validation_total_cost_history) - 1,
             }
 
@@ -205,7 +232,9 @@ class MC_PILCO_gym(MC_PILCO):
         self.validation_trial_index_history.append(trial_index)
         validation_total_cost = self._compute_validation_total_cost(noiseless_samples, input_samples, trial_index)
         self.validation_total_cost_history.append(validation_total_cost)
-        self._update_best_validation_policy(policy_name, trial_index, validation_total_cost)
+        metrics = None if validation_total_cost is None else self._validation_selection_metrics(noiseless_samples, validation_total_cost)
+        self.validation_selection_metrics_history.append(metrics)
+        self._update_best_validation_policy(policy_name, trial_index, metrics)
 
         if self.log_path is not None:
             self._write_validation_log()
@@ -221,6 +250,7 @@ class MC_PILCO_gym(MC_PILCO):
         self.log_dict["validation_policy_history"] = self.validation_policy_history
         self.log_dict["validation_trial_index_history"] = self.validation_trial_index_history
         self.log_dict["validation_total_cost_history"] = self.validation_total_cost_history
+        self.log_dict["validation_selection_metrics_history"] = self.validation_selection_metrics_history
         self.log_dict["best_validation_cost"] = self.best_validation_cost
         self.log_dict["best_validation_policy_meta"] = self.best_validation_policy_meta
         if self.best_validation_policy_state is not None:
